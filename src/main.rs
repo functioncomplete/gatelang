@@ -4,11 +4,12 @@
 //!   gatelang <file.gat>                    编译并打印资源
 //!   gatelang <file.gat> --verify           运行 spec 验证
 //!   gatelang <file.gat> --check-equiv A B  检查 A 与 B 组合电路等价
+//!   gatelang <file.gat> --check-equiv A B --domain "expr"   在约束输入域内检查等价
 //!   gatelang <file.gat> --sim NAME a b     模拟组合电路（十进制输入）
 
 use std::process::ExitCode;
 
-use gatelang::equiv::{check_equiv, sig};
+use gatelang::equiv::{check_equiv_domain, sig};
 use gatelang::lower::Compiler;
 use gatelang::parser::parse_program;
 use gatelang::resource::summarize;
@@ -48,11 +49,22 @@ fn main() -> ExitCode {
     if let Some(pos) = args.iter().position(|a| a == "--check-equiv") {
         let a_name = args.get(pos + 1).cloned().unwrap_or_default();
         let b_name = args.get(pos + 2).cloned().unwrap_or_default();
+        // 约束域：--domain "expr"（全局选项，可出现在任意位置）
+        let domain = args
+            .iter()
+            .position(|a| a == "--domain")
+            .and_then(|p| args.get(p + 1).cloned());
         let a = compiled.iter().find(|c| sig(c).starts_with(&a_name));
         let b = compiled.iter().find(|c| sig(c).starts_with(&b_name));
         match (a, b) {
-            (Some(a), Some(b)) => match check_equiv(a, b) {
-                Ok((true, _)) => println!("\n== 等价性 ==\n{} 与 {} 语义等价 ✓", a_name, b_name),
+            (Some(a), Some(b)) => match check_equiv_domain(a, b, domain.as_deref()) {
+                Ok((true, _)) => {
+                    print!("\n== 等价性 ==\n{} 与 {} 语义等价 ✓", a_name, b_name);
+                    if let Some(d) = &domain {
+                        print!("（约束域: {d}）");
+                    }
+                    println!();
+                }
                 Ok((false, Some(reason))) => {
                     println!("\n== 等价性 ==\n{} 与 {} 不等价: {reason}", a_name, b_name);
                     return ExitCode::from(1);

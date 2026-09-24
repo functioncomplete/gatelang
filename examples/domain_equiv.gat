@@ -1,0 +1,15 @@
+// 约束域等价演示：FullAdd 与 FullAdd2 在 a<2 && b<2（即低位全加器输入域）等价，
+// 但在全域不等价（FullAdd 真全加器，FullAdd2 截断 carry）。
+circuit FullAdd(a: Bit, b: Bit, cin: Bit) -> (sum: Bit, cout: Bit) {
+    ab = XOR(a, b);
+    sum = XOR(ab, cin);
+    cout = OR(AND(a, b), AND(cin, ab));
+    return (sum, cout);
+}
+
+// 坏实现：cin=1 && (a,b)=(1,0) 时 cout 算错（不做 a*cin 项）
+circuit FullAdd2(a: Bit, b: Bit, cin: Bit) -> (sum: Bit, cout: Bit) {
+    sum = XOR(XOR(a, b), cin);
+    cout = OR(AND(a, b), AND(b, cin));
+    return (sum, cout);
+}

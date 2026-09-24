@@ -1,0 +1,57 @@
+// 模板库 L1：全加器、MUX、比较器（白皮书 v2.1 附录模板库）
+// 全部以 GateLang 源码实现，编译为 NAND 网表。
+
+// 全加器：sum = a^b^c, cout = (a&b)|(c&(a^b))
+// 门数 = 2×XOR(4) + 2×AND(2) + OR(3) = 15
+circuit FullAdder(a: Bit, b: Bit, cin: Bit) -> (sum: Bit, cout: Bit) {
+    ab = XOR(a, b);
+    sum = XOR(ab, cin);
+    ab_and = AND(a, b);
+    cin_ab = AND(cin, ab);
+    cout = OR(ab_and, cin_ab);
+    return (sum, cout);
+}
+
+// 2 选 1 MUX：out = sel ? a : b
+// 门数 = 2×AND(2) + OR(3) + NOT(1) = 8 每 bit
+circuit Mux2(a: Bit, b: Bit, sel: Bit) -> Bit {
+    sa = AND(a, sel);
+    nsel = NOT(sel);
+    sb = AND(b, nsel);
+    out = OR(sa, sb);
+    return out;
+}
+
+// 4 位比较器：eq(相等) / gt(a>b)
+// eq = AND of XNOR；gt = 逐位从高位比较（三元用 `cond if t else e`）
+circuit Comparator4(a: Bits<4>, b: Bits<4>) -> (eq: Bit, gt: Bit) {
+    d3 = XOR(a[3], b[3]);
+    d2 = XOR(a[2], b[2]);
+    d1 = XOR(a[1], b[1]);
+    d0 = XOR(a[0], b[0]);
+    // 相等：任何位不同则不等
+    eq = !(d3 | d2 | d1 | d0);
+    // 大于：最高位优先
+    gt = d3 if a[3] else (d2 if a[2] else (d1 if a[1] else (d0 if a[0] else 0)));
+    return (eq, gt);
+}
+spec FCT.stdlib.fulladder {
+    precondition: true;
+    postcondition: sum == (a + b + cin) % 2 && cout == ((a + b + cin) >= 2);
+    invariant: true;
+    edge_cases: [a=0,b=0,cin=0, a=1,b=1,cin=1, a=1,b=0,cin=1];
+}
+
+spec FCT.stdlib.mux2 {
+    precondition: true;
+    postcondition: out == (a * sel + b * (1 - sel));
+    invariant: true;
+    edge_cases: [a=0,b=0,sel=0, a=1,b=0,sel=1, a=0,b=1,sel=0];
+}
+
+spec FCT.stdlib.comparator4 {
+    precondition: true;
+    postcondition: eq == ((a - b) == 0);
+    invariant: true;
+    edge_cases: [a=0,b=0, a=15,b=0, a=8,b=8, a=1,b=15];
+}

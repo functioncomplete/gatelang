@@ -1,13 +1,19 @@
-//! 等价性检查（白皮书 §4.3 / §6.3）：两个电路在全输入域上行为一致。
+//! 等价性检查（白皮书 §4.3 / §6.3）：两个电路在指定输入域上行为一致。
 //!
-//! 原型：对输入位宽 ≤ 16 的组合电路做穷举验证（2^N 输入，N = 总输入位宽）。
-//! 另支持「优化电路 vs 参考电路」的语义等价。
+//! 原型：对输入位宽 ≤ 20 的组合电路做穷举验证（2^N 输入，N = 总输入位宽）。
+//! 支持 `domain` 约束表达式（同 spec 求值器语法）裁剪输入域，例如
+//! `a<8 && b<8` 只比较 0..8 × 0..8 的输入。
 
 use crate::ast::Width;
 use crate::lower::Compiled;
 
-/// 穷举验证两个组合电路等价。返回是否等价，以及反例（若有）。
-pub fn check_equiv(a: &Compiled, b: &Compiled) -> Result<(bool, Option<String>), String> {
+/// 穷举验证两个组合电路在约束域内等价。返回是否等价，以及反例（若有）。
+/// `domain` 为 None 时全输入域；Some(expr) 时用 spec 求值器过滤。
+pub fn check_equiv_domain(
+    a: &Compiled,
+    b: &Compiled,
+    domain: Option<&str>,
+) -> Result<(bool, Option<String>), String> {
     let (an, ai, ao) = match a {
         Compiled::Combinational { name, inputs, outputs, netlist: _, .. } => {
             let bits: u32 = inputs.iter().map(|p| p.width.bits()).sum();
@@ -38,6 +44,11 @@ pub fn check_equiv(a: &Compiled, b: &Compiled) -> Result<(bool, Option<String>),
         _ => unreachable!(),
     };
     let n = 1u128 << ai;
+    // 约束域预解析（解析失败即报错，不静默忽略）
+    let domain_expr = match domain {
+        Some(d) if !d.trim().is_empty() => Some(crate::spec::parse_spec(d)?),
+        _ => None,
+    };
     for x in 0..n {
         let mut a_in_map = crate::sim::Inputs::new();
         let mut b_in_map = crate::sim::Inputs::new();
@@ -52,6 +63,14 @@ pub fn check_equiv(a: &Compiled, b: &Compiled) -> Result<(bool, Option<String>),
             let bval = (x >> offset) & bmask;
             b_in_map.insert(b_in[i].name.clone(), bval);
             offset += w;
+        }
+        // 约束域过滤：不满足 domain 的输入不比较
+        if let Some(de) = &domain_expr {
+            let v = crate::spec::eval_spec(de, &a_in_map)
+                .map_err(|e| format!("domain 求值错误: {e}"))?;
+            if v == 0 {
+                continue;
+            }
         }
         let ra = crate::sim::eval_netlist(a_nl, &a_in_map);
         let rb = crate::sim::eval_netlist(b_nl, &b_in_map);
@@ -75,6 +94,11 @@ pub fn check_equiv(a: &Compiled, b: &Compiled) -> Result<(bool, Option<String>),
         }
     }
     Ok((true, None))
+}
+
+/// 兼容入口：无约束域。
+pub fn check_equiv(a: &Compiled, b: &Compiled) -> Result<(bool, Option<String>), String> {
+    check_equiv_domain(a, b, None)
 }
 
 /// 便捷：接口描述。

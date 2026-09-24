@@ -102,3 +102,57 @@ fn counter_state_compiles_and_cycles() {
         _ => panic!("应为时序"),
     }
 }
+#[test]
+fn domain_equiv_filters_counterexample() {
+    // 全域不等价（cin 特例），约束域 a==1&&b==1 等价
+    let src = r#"circuit FA(a: Bit, b: Bit, cin: Bit) -> (sum: Bit, cout: Bit) {
+        sum = XOR(XOR(a, b), cin);
+        cout = OR(AND(a, b), AND(cin, XOR(a, b)));
+        return (sum, cout);
+    }
+    circuit FA2(a: Bit, b: Bit, cin: Bit) -> (sum: Bit, cout: Bit) {
+        sum = XOR(XOR(a, b), cin);
+        cout = OR(AND(a, b), AND(b, cin));
+        return (sum, cout);
+    }"#;
+    let (_, c) = compile(src);
+    let fa = c.iter().find(|x| gatelang::equiv::sig(x).starts_with("FA(")).unwrap();
+    let fa2 = c.iter().find(|x| gatelang::equiv::sig(x).starts_with("FA2(")).unwrap();
+    // 全域：不等价
+    let (ok, ce) = gatelang::equiv::check_equiv_domain(fa, fa2, None).expect("domains");
+    assert!(!ok, "全域应不等价");
+    assert!(ce.is_some(), "应给出反例");
+    // 约束域 a==1 && b==1：等价
+    let (ok, _) = gatelang::equiv::check_equiv_domain(fa, fa2, Some("a==1 && b==1")).expect("domain");
+    assert!(ok, "约束域内应等价");
+}
+
+#[test]
+fn full_adder_mux_comparator_specs() {
+    // stdlib 模板库：FA / Mux2 / Comparator4 spec 全过
+    let src = r#"circuit FullAdder(a: Bit, b: Bit, cin: Bit) -> (sum: Bit, cout: Bit) {
+        ab = XOR(a, b);
+        sum = XOR(ab, cin);
+        cout = OR(AND(a, b), AND(cin, ab));
+        return (sum, cout);
+    }
+    spec FCT.stdlib.fulladder {
+        precondition: true;
+        postcondition: sum == (a + b + cin) % 2 && cout == ((a + b + cin) >= 2);
+        invariant: true;
+        edge_cases: [a=0,b=0,cin=0, a=1,b=1,cin=1, a=1,b=0,cin=1];
+    }
+    circuit Mux2(a: Bit, b: Bit, sel: Bit) -> Bit {
+        out = OR(AND(a, sel), AND(b, NOT(sel)));
+        return out;
+    }
+    spec FCT.stdlib.mux2 {
+        precondition: true;
+        postcondition: out == (a * sel + b * (1 - sel));
+        invariant: true;
+        edge_cases: [a=0,b=0,sel=0, a=1,b=0,sel=1, a=0,b=1,sel=0];
+    }"#;
+    let (decls, c) = compile(src);
+    let rep = verify_all(&decls, &c);
+    assert_eq!(rep.passed, 2, "两个模板 spec 都应通过: {:?}", rep.failed);
+}
