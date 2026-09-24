@@ -1,0 +1,16 @@
+[package]
+name = "gatelang"
+version = "0.1.0"
+edition = "2021"
+description = "GateLang — NAND/LATCH 门级可验证计算语言（M5 原型）"
+license = "MIT"
+
+[lib]
+name = "gatelang"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gatelang"
+path = "src/main.rs"
+
+[dependencies]

@@ -1,0 +1,27 @@
+// 半加器示例（白皮书 v2.1 §4.2 + §4.3 语义保持展开）
+// 规范级共享 t=NAND(a,b)：整个半加器 = 5 个 NAND 门
+// （lib/netlist.rs 的 half_adder() 是 5 门；此处用 GateLang 源码展开同构验证）
+circuit HalfAdder5(a: Bit, b: Bit) -> (sum: Bit, carry: Bit) {
+    t = NAND(a, b);
+    carry = NOT(t);
+    lt = NAND(a, t);
+    rt = NAND(b, t);
+    sum = NAND(lt, rt);
+    return (sum, carry);
+}
+
+// 对照实现：直接门级原语（XOR=4 + AND=2 = 6 门，无共享优化）
+circuit HalfAdderNaive(a: Bit, b: Bit) -> (sum: Bit, carry: Bit) {
+    sum = XOR(a, b);
+    carry = AND(a, b);
+    return (sum, carry);
+}
+
+// 上面两个应语义等价（等价性检查在 --check-equiv 下运行）
+// spec 绑定到 HalfAdder5：真值表枚举验证其行为与半加器真值一致
+spec FCT.halfadder.halfadder5 {
+    precondition: true;
+    postcondition: sum == (a + b) % 2 && carry == ((a + b) >= 2);
+    invariant: true;
+    edge_cases: [a=0,b=0, a=0,b=1, a=1,b=0, a=1,b=1];
+}

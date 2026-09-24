@@ -1,0 +1,13 @@
+// 半加器示例（白皮书 v2.1 §4.2）
+// 共享 t=NAND(a,b)：整个半加器 = 5 个 NAND 门
+circuit HalfAdder(a: Bit, b: Bit) -> (sum: Bit, carry: Bit) {
+    sum = XOR(a, b);
+    carry = AND(a, b);
+    return (sum, carry);
+}
+
+// 4 位加法器：s = (a + b) mod 2^4，60 门
+circuit Adder4(a: Bits<4>, b: Bits<4>) -> (s: Bits<4>) {
+    s = a + b;
+    return (s);
+}

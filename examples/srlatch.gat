@@ -1,0 +1,22 @@
+// SRLatch —— 基础时序元件（状态机 L-3 级别）
+state SRLatch {
+    latch q: Bit = 0;
+    latch nq: Bit = 1;
+
+    fn set(r: Bit, s: Bit) -> (q: Bit, nq: Bit) {
+        q <- NOT(s);       // 置位：s=1 → q 为 0（SR 锁存语义）
+        nq <- NOT(r);
+        return (q, nq);
+    }
+}
+
+// 计数器：每周期 +1（用作交通灯核心计时）
+state Counter {
+    latch value: Bits<4> = 0;
+    latch clock: Bit = 0;
+
+    fn tick() -> Bits<4> {
+        value <- value + 1;
+        return value;
+    }
+}

@@ -1,0 +1,12 @@
+// 4 位加法器：s = (a + b) mod 2^4，60 门（FA = 15 门 × 4）
+circuit Adder4(a: Bits<4>, b: Bits<4>) -> (s: Bits<4>) {
+    s = a + b;
+    return s;
+}
+
+spec FCT.math.adder4 {
+    precondition: a < 2^4 && b < 2^4;
+    postcondition: s == (a + b) % (2^4);
+    invariant: true;
+    edge_cases: [a=0,b=0, a=15,b=15, a=MAX_UINT,b=0];
+}

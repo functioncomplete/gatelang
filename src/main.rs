@@ -1,0 +1,113 @@
+//! gatelang CLI —— 编译 / 资源报告 / spec 验证 / 等价检查 / 模拟。
+//!
+//! 用法：
+//!   gatelang <file.gat>                    编译并打印资源
+//!   gatelang <file.gat> --verify           运行 spec 验证
+//!   gatelang <file.gat> --check-equiv A B  检查 A 与 B 组合电路等价
+//!   gatelang <file.gat> --sim NAME a b     模拟组合电路（十进制输入）
+
+use std::process::ExitCode;
+
+use gatelang::equiv::{check_equiv, sig};
+use gatelang::lower::Compiler;
+use gatelang::parser::parse_program;
+use gatelang::resource::summarize;
+use gatelang::verify::verify_all;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        eprintln!("用法: gatelang <file.gat> [--verify] [--check-equiv A B] [--sim NAME vals...]");
+        return ExitCode::from(2);
+    }
+    let src = match std::fs::read_to_string(&args[1]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("读取失败: {e}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let decls = match parse_program(&src) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("解析错误: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let mut compiler = Compiler::new(&decls);
+    let compiled = compiler.compile_all();
+
+    // 默认：资源报告
+    println!("== 编译产物 ==");
+    for c in &compiled {
+        println!("{}", summarize(c));
+    }
+    // 等价值对比
+    if let Some(pos) = args.iter().position(|a| a == "--check-equiv") {
+        let a_name = args.get(pos + 1).cloned().unwrap_or_default();
+        let b_name = args.get(pos + 2).cloned().unwrap_or_default();
+        let a = compiled.iter().find(|c| sig(c).starts_with(&a_name));
+        let b = compiled.iter().find(|c| sig(c).starts_with(&b_name));
+        match (a, b) {
+            (Some(a), Some(b)) => match check_equiv(a, b) {
+                Ok((true, _)) => println!("\n== 等价性 ==\n{} 与 {} 语义等价 ✓", a_name, b_name),
+                Ok((false, Some(reason))) => {
+                    println!("\n== 等价性 ==\n{} 与 {} 不等价: {reason}", a_name, b_name);
+                    return ExitCode::from(1);
+                }
+                Ok((false, None)) => {
+                    println!("\n== 等价性 ==\n{} 与 {} 不等价", a_name, b_name);
+                    return ExitCode::from(1);
+                }
+                Err(e) => {
+                    println!("等价检查错误: {e}");
+                    return ExitCode::from(1);
+                }
+            },
+            _ => {
+                println!("缺少可比对电路（--check-equiv NAME_A NAME_B）");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    // spec 验证
+    if args.iter().any(|a| a == "--verify") {
+        let rep = verify_all(&decls, &compiled);
+        println!("\n== spec 验证 ==");
+        println!("通过 {}/{}", rep.passed, rep.total);
+        if !rep.failed.is_empty() {
+            for f in &rep.failed {
+                println!("  ✗ {f}");
+            }
+            return ExitCode::from(1);
+        }
+        println!("  ✓ 全部满足规范");
+    }
+    // 模拟
+    if let Some(pos) = args.iter().position(|a| a == "--sim") {
+        let name = args.get(pos + 1).cloned().unwrap_or_default();
+        let c = compiled.iter().find(|c| sig(c).starts_with(&name)).cloned();
+        match c {
+            Some(gatelang::lower::Compiled::Combinational { inputs, outputs, netlist, .. }) => {
+                let vals: Vec<u128> = args[pos + 2..]
+                    .iter()
+                    .filter_map(|s| u128::from_str_radix(s, 10).ok())
+                    .collect();
+                if vals.len() < inputs.len() {
+                    println!("模拟需 {} 个输入，实际 {} 个", inputs.len(), vals.len());
+                    return ExitCode::from(2);
+                }
+                let res = gatelang::sim::sim_combinational(&inputs, &outputs, &netlist, &vals);
+                println!("\n== 模拟 {name} ==");
+                for (i, o) in outputs.iter().enumerate() {
+                    println!("  {} = {}", o.name, res[i]);
+                }
+            }
+            Some(_) => println!("{name} 是时序模块，--sim 仅支持组合电路"),
+            None => println!("未找到 {name}"),
+        }
+    }
+    ExitCode::SUCCESS
+}

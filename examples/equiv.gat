@@ -1,0 +1,23 @@
+// 等价性验证示例：同一函数的不同展开是否语义一致
+// XorGate（门级原语 4 门）vs XorExpanded（结构化 NAND 展开 4 门）
+// 用 --check-equiv XorGate XorExpanded 验证语义等价；用 --verify 验证真值表规范。
+
+circuit XorGate(a: Bit, b: Bit) -> (y: Bit) {
+    y = XOR(a, b);
+    return y;
+}
+
+circuit XorExpanded(a: Bit, b: Bit) -> (y: Bit) {
+    n1 = NAND(a, b);
+    n2 = NAND(a, n1);
+    n3 = NAND(b, n1);
+    y = NAND(n2, n3);
+    return y;
+}
+
+spec FCT.logic.xorgate {
+    precondition: true;
+    postcondition: y == (a + b) % 2;
+    invariant: true;
+    edge_cases: [a=0,b=0, a=0,b=1, a=1,b=0, a=1,b=1];
+}
