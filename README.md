@@ -1,5 +1,10 @@
 # GateLang — NAND/LATCH 门级可验证计算语言
 
+[![tests](https://img.shields.io/badge/tests-30%20passing-brightgreen)](tests/integration.rs)
+[![rust](https://img.shields.io/badge/rust-1.96-orange)](https://www.rust-lang.org/)
+[![dependencies](https://img.shields.io/badge/dependencies-0-blue)](#构建与测试)
+[![FCT backend](https://img.shields.io/badge/FCT%20v1.3-%C2%A7%203.3-cyan)](https://github.com/functioncomplete/code)
+
 M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文档 v2.1》）。
 
 ```text
