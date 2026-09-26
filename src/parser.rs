@@ -15,13 +15,14 @@ use crate::lexer::{tokenize, Tok, Token};
 pub struct Parser {
     toks: Vec<Token>,
     pos: usize,
+    depth: usize,
 }
 
 type PResult<T> = Result<T, String>;
 
 impl Parser {
-    pub fn new(src: &str) -> Self {
-        Parser { toks: tokenize(src), pos: 0 }
+    pub fn new(src: &str) -> Result<Self, String> {
+        Ok(Parser { toks: tokenize(src)?, pos: 0, depth: 0 })
     }
 
     fn peek(&self) -> &Tok {
@@ -78,7 +79,12 @@ impl Parser {
     // ---- 顶层 ----
 
     pub fn parse_program(src: &str) -> PResult<Vec<Decl>> {
-        let mut p = Parser::new(src);
+        let mut p = Parser::new(src)?;
+        // 源文件 token 上限：AST 规模（进而递归 Drop / eval 深度）有界，
+        // 防止超深 AST 在 drop 时栈溢出（不可捕获的 abort）。
+        if p.toks.len() > 8_000 {
+            return Err(format!("源文件过大（token {} > 8000）", p.toks.len()));
+        }
         let mut decls = Vec::new();
         while *p.peek() != Tok::Eof {
             decls.push(p.parse_decl()?);
@@ -113,7 +119,15 @@ impl Parser {
             "Bits" => {
                 self.expect(&Tok::Lt, "<")?;
                 let n = match self.bump() {
-                    Tok::Uint(v, _) => v as u32,
+                    Tok::Uint(v, _) => {
+                        if v > u32::MAX as u128 {
+                            return Err(format!("{sp:?}: Bits<N> 宽度超出 u32: {v}"));
+                        }
+                        if v == 0 {
+                            return Err(format!("{sp:?}: Bits<0> 无意义"));
+                        }
+                        v as u32
+                    }
                     other => return Err(format!("{sp:?}: Bits<N> 期望宽度数字，实际 {other:?}")),
                 };
                 self.expect(&Tok::Gt, ">")?;
@@ -161,7 +175,12 @@ impl Parser {
                                 }
                                 self.expect(&Tok::Lt, "<")?;
                                 let n = match self.bump() {
-                                    Tok::Uint(v, _) => v as u32,
+                                    Tok::Uint(v, _) => {
+                                        if v > u32::MAX as u128 {
+                                            return Err(format!("{:?}: 资源上界超出 u32: {v}", self.span()));
+                                        }
+                                        v as u32
+                                    }
                                     other => return Err(format!("{:?}: Gates<N> 期望数字，实际 {other:?}", self.span())),
                                 };
                                 self.expect(&Tok::Gt, ">")?;
@@ -176,7 +195,12 @@ impl Parser {
                                 }
                                 self.expect(&Tok::Lt, "<")?;
                                 let n = match self.bump() {
-                                    Tok::Uint(v, _) => v as u32,
+                                    Tok::Uint(v, _) => {
+                                        if v > u32::MAX as u128 {
+                                            return Err(format!("{:?}: 资源上界超出 u32: {v}", self.span()));
+                                        }
+                                        v as u32
+                                    }
                                     other => return Err(format!("{:?}: Depth<N> 期望数字，实际 {other:?}", self.span())),
                                 };
                                 self.expect(&Tok::Gt, ">")?;
@@ -191,7 +215,12 @@ impl Parser {
                                 }
                                 self.expect(&Tok::Lt, "<")?;
                                 let n = match self.bump() {
-                                    Tok::Uint(v, _) => v as u32,
+                                    Tok::Uint(v, _) => {
+                                        if v > u32::MAX as u128 {
+                                            return Err(format!("{:?}: 资源上界超出 u32: {v}", self.span()));
+                                        }
+                                        v as u32
+                                    }
                                     other => return Err(format!("{:?}: Cycles<N> 期望数字，实际 {other:?}", self.span())),
                                 };
                                 self.expect(&Tok::Gt, ">")?;
@@ -321,6 +350,12 @@ impl Parser {
     }
 
     fn parse_if_stmt(&mut self) -> PResult<Stmt> {
+        // if 也是递归入口（块内可再嵌 if），须计入深度。
+        self.depth += 1;
+        if self.depth > 128 {
+            self.depth -= 1;
+            return Err(format!("{:?}: if 嵌套过深（>128）", self.span()));
+        }
         let sp = self.span();
         self.bump(); // if
         let cond = self.parse_expr()?;
@@ -329,6 +364,7 @@ impl Parser {
         if self.eat(&Tok::Else) {
             else_body = self.parse_block()?;
         }
+        self.depth -= 1;
         Ok(Stmt::If(Box::new(IfStmt { cond, then_body, else_body, span: sp })))
     }
 
@@ -505,7 +541,16 @@ impl Parser {
     // ---- 表达式 ----
 
     fn parse_expr(&mut self) -> PResult<Expr> {
-        self.parse_ternary()
+        // 递归深度上限：防止畸形输入（如数千层括号）导致栈溢出（不可捕获的 abort）。
+        // 每层括号约耗 9 个栈帧，128 层对 2MB 线程栈安全，且远超真实表达式嵌套。
+        self.depth += 1;
+        if self.depth > 128 {
+            self.depth -= 1;
+            return Err(format!("{:?}: 表达式嵌套过深（>128）", self.span()));
+        }
+        let r = self.parse_ternary();
+        self.depth -= 1;
+        r
     }
 
     fn parse_ternary(&mut self) -> PResult<Expr> {
@@ -523,7 +568,12 @@ impl Parser {
 
     fn parse_or(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_and()?;
+        let mut n = 0u32;
         while self.eat(&Tok::Pipe) {
+            n += 1;
+            if n > 256 {
+                return Err(format!("{:?}: 表达式运算项过多（>256）", self.span()));
+            }
             let sp = self.span();
             let rhs = self.parse_and()?;
             lhs = Expr::Bin(BinOp::Or, Box::new(lhs), Box::new(rhs), sp);
@@ -533,7 +583,12 @@ impl Parser {
 
     fn parse_and(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_cmp()?;
+        let mut n = 0u32;
         while self.eat(&Tok::Amp) {
+            n += 1;
+            if n > 256 {
+                return Err(format!("{:?}: 表达式运算项过多（>256）", self.span()));
+            }
             let sp = self.span();
             let rhs = self.parse_cmp()?;
             lhs = Expr::Bin(BinOp::And, Box::new(lhs), Box::new(rhs), sp);
@@ -543,12 +598,17 @@ impl Parser {
 
     fn parse_cmp(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_add()?;
+        let mut n = 0u32;
         loop {
             let (op, sp) = match self.peek().clone() {
                 Tok::EqEq => (BinOp::Eq, self.span()),
                 Tok::Ne => (BinOp::Ne, self.span()),
                 _ => break,
             };
+            n += 1;
+            if n > 256 {
+                return Err(format!("{:?}: 表达式运算项过多（>256）", self.span()));
+            }
             self.bump();
             let rhs = self.parse_add()?;
             lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs), sp);
@@ -558,7 +618,12 @@ impl Parser {
 
     fn parse_add(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_unary()?;
+        let mut n = 0u32;
         while self.eat(&Tok::Plus) {
+            n += 1;
+            if n > 256 {
+                return Err(format!("{:?}: 表达式运算项过多（>256）", self.span()));
+            }
             let sp = self.span();
             let rhs = self.parse_unary()?;
             lhs = Expr::Bin(BinOp::Add, Box::new(lhs), Box::new(rhs), sp);
@@ -568,8 +633,15 @@ impl Parser {
 
     fn parse_unary(&mut self) -> PResult<Expr> {
         if self.eat(&Tok::Bang) {
+            // 一元 ! 也是递归入口，须计入深度（否则数千层 ! 会栈溢出 abort）。
+            self.depth += 1;
+            if self.depth > 128 {
+                self.depth -= 1;
+                return Err(format!("{:?}: 表达式嵌套过深（>128）", self.span()));
+            }
             let sp = self.span();
             let e = self.parse_unary()?;
+            self.depth -= 1;
             return Ok(Expr::Not(Box::new(e), sp));
         }
         self.parse_postfix()
@@ -577,7 +649,12 @@ impl Parser {
 
     fn parse_postfix(&mut self) -> PResult<Expr> {
         let mut e = self.parse_primary()?;
+        let mut n = 0u32;
         loop {
+            n += 1;
+            if n > 256 {
+                return Err(format!("{:?}: 下标/切片链过长（>256）", self.span()));
+            }
             match self.peek().clone() {
                 Tok::LBracket => {
                     self.bump();
@@ -608,14 +685,26 @@ impl Parser {
         match self.peek().clone() {
             Tok::Uint(v, raw) => {
                 self.bump();
+                // 字面量溢出 u128 时 lexer 会静默给 0 —— 在此显式报错。
+                let checked = if raw.starts_with("0b") {
+                    u128::from_str_radix(raw.trim_start_matches("0b"), 2)
+                } else {
+                    raw.parse::<u128>()
+                };
+                if checked.is_err() {
+                    return Err(format!("{sp:?}: 数值字面量超出 u128: {raw}"));
+                }
                 // 0b101 → Bits<3>；整数 → 视上下文，这里标记 Bits（宽度由 raw 决定位数或 1 位）
                 let w = if raw.starts_with("0b") {
                     Width::Bits(raw.len() as u32 - 2)
                 } else if v <= 1 {
                     Width::Bit
-                } else {
+                } else if v <= 0xFF {
                     // 十进制整数按 8 位（原型）
                     Width::Bits(8)
+                } else {
+                    // 超出 8 位会被静默截断（如 256→0），导致错误编译/假验证 → 明确报错
+                    return Err(format!("{sp:?}: 十进制字面量 {raw} 超出 8 位；请用 0b… 指定位宽"));
                 };
                 Ok(Expr::Lit(v, w, sp))
             }

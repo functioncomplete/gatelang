@@ -40,6 +40,20 @@ impl LowerError {
 
 pub type LowerResult<T> = Result<T, LowerError>;
 
+/// 单个电路内联展开的网表规模上限（防组合爆炸导致 OOM/挂死）。
+/// 模板库最大仅 60 门，100k 为极宽裕的原型上限。
+const MAX_NETLIST_GATES: usize = 100_000;
+
+/// 全部声明累计门数上限（防"多声明 × 大模板"的跨声明总量 OOM）。
+const MAX_TOTAL_GATES: usize = 500_000;
+
+fn compiled_gates(c: &Compiled) -> usize {
+    match c {
+        Compiled::Combinational { netlist, .. } => netlist.gates.len(),
+        Compiled::State { fns, .. } => fns.iter().map(|f| f.netlist.gates.len()).sum(),
+    }
+}
+
 /// 编译产物：电路（组合）或时序模块（时序）。
 #[derive(Debug, Clone)]
 pub enum Compiled {
@@ -85,8 +99,9 @@ impl<'a> Compiler<'a> {
     }
 
     /// 编译所有顶层声明（按依赖拓扑自动解析，两次遍历：先收集后编译）。
-    pub fn compile_all(&mut self) -> Vec<Compiled> {
+    pub fn compile_all(&mut self) -> Result<Vec<Compiled>, String> {
         let mut out = Vec::new();
+        let mut total_gates: usize = 0;
         let names: Vec<String> = self
             .decls
             .iter()
@@ -97,7 +112,11 @@ impl<'a> Compiler<'a> {
             })
             .collect();
         for n in names {
-            self.compile_named(&n);
+            let c = self.compile_named(&n)?;
+            total_gates += compiled_gates(&c);
+            if total_gates > MAX_TOTAL_GATES {
+                return Err(format!("全部声明累计门数超限（> {MAX_TOTAL_GATES}）"));
+            }
         }
         // 依序输出
         for n in self
@@ -113,31 +132,32 @@ impl<'a> Compiler<'a> {
                 out.push(c.clone());
             }
         }
-        out
+        Ok(out)
     }
 
-    fn compile_named(&mut self, name: &str) -> Compiled {
+    fn compile_named(&mut self, name: &str) -> Result<Compiled, String> {
         if let Some(c) = self.cache.get(name) {
-            return c.clone();
+            return Ok(c.clone());
         }
         // 查找声明
         for d in self.decls {
             match (d, name) {
                 (Decl::Circuit(c), n) if c.name == *n => {
                     let compiled = circuit_lower(c, self, 0, Vec::new())
-                        .unwrap_or_else(|e| panic!("lower {} 失败: {} @ {:?}", c.name, e.msg, e.span));
+                        .map_err(|e| format!("lower {} 失败: {} @ {:?}", c.name, e.msg, e.span))?;
                     self.cache.insert(name.to_string(), compiled.clone());
-                    return compiled;
+                    return Ok(compiled);
                 }
                 (Decl::State(s), n) if s.name == *n => {
-                    let compiled = state_lower(s, self).unwrap_or_else(|e| panic!("lower {} 失败: {} @ {:?}", s.name, e.msg, e.span));
+                    let compiled = state_lower(s, self)
+                        .map_err(|e| format!("lower {} 失败: {} @ {:?}", s.name, e.msg, e.span))?;
                     self.cache.insert(name.to_string(), compiled.clone());
-                    return compiled;
+                    return Ok(compiled);
                 }
                 _ => {}
             }
         }
-        panic!("未找到声明 {name}");
+        Err(format!("未找到声明 {name}"))
     }
 
     /// 查找组合电路，供结构组合内联。
@@ -147,7 +167,7 @@ impl<'a> Compiler<'a> {
         if depth > 32 {
             panic!("组合递归过深（含循环引用？）:{name}");
         }
-        self.compile_named(name)
+        self.compile_named(name).unwrap_or_else(|e| panic!("{e}"))
     }
 }
 
@@ -172,14 +192,24 @@ fn lower_expr(
     expr: &Expr,
     env: &mut Env,
     nl: &mut Netlist,
-    budget: &mut ResourceBudget,
     decls: &[Decl],
     _modal: Modal,
     depth: usize,
+    edepth: usize,
 ) -> LowerResult<Value> {
+    if edepth > 512 {
+        return Err(LowerError::new(Span::new(0, 0), "表达式嵌套过深（求值）"));
+    }
+    // 每次表达式求值入口检查网表规模：单条 giant 表达式（如巨型 return）也受限于此。
+    if nl.gates.len() > MAX_NETLIST_GATES {
+        return Err(LowerError::new(Span::new(0, 0), "网表规模超限（表达式过大）"));
+    }
     match expr {
-        Expr::Lit(v, w, _sp) => {
+        Expr::Lit(v, w, sp) => {
             let width = w.bits();
+            if width > 128 {
+                return Err(LowerError::new(*sp, "字面量位宽 > 128 不支持"));
+            }
             let mut sigs = Vec::with_capacity(width as usize);
             for i in 0..width {
                 let bit = (v >> i) & 1;
@@ -202,44 +232,49 @@ fn lower_expr(
             Err(LowerError::new(*sp, &format!("未定义变量/参数: {name}")))
         }
         Expr::Call(callee, args, sp) => {
+            // 门原语元数校验：避免 args[i] 越界 panic（如 NAND(a)）
+            match callee.as_str() {
+                "AND" | "OR" | "XOR" | "NAND" if args.len() != 2 => {
+                    return Err(LowerError::new(*sp, &format!("{callee} 需要 2 个参数，实际 {}", args.len())));
+                }
+                "NOT" if args.len() != 1 => {
+                    return Err(LowerError::new(*sp, &format!("NOT 需要 1 个参数，实际 {}", args.len())));
+                }
+                _ => {}
+            }
             // 关键字门：AND/OR/XOR/NOT/NAND
             match callee.as_str() {
                 "AND" => {
-                    let va = lower_expr(&args[0], env, nl, budget, decls, _modal, depth)?;
-                    let vb = lower_expr(&args[1], env, nl, budget, decls, _modal, depth)?;
+                    let va = lower_expr(&args[0], env, nl, decls, _modal, depth, edepth + 1)?;
+                    let vb = lower_expr(&args[1], env, nl, decls, _modal, depth, edepth + 1)?;
                     need_width(&va, &vb, *sp)?;
                     let sigs = va.sigs.iter().zip(vb.sigs.iter()).map(|(&a, &b)| nl.and(a, b)).collect();
-                    budget.add_gates(2 * va.width);
                     Ok(Value { sigs, width: va.width })
                 }
                 "OR" => {
-                    let va = lower_expr(&args[0], env, nl, budget, decls, _modal, depth)?;
-                    let vb = lower_expr(&args[1], env, nl, budget, decls, _modal, depth)?;
+                    let va = lower_expr(&args[0], env, nl, decls, _modal, depth, edepth + 1)?;
+                    let vb = lower_expr(&args[1], env, nl, decls, _modal, depth, edepth + 1)?;
                     need_width(&va, &vb, *sp)?;
                     let sigs = va.sigs.iter().zip(vb.sigs.iter()).map(|(&a, &b)| nl.or(a, b)).collect();
-                    budget.add_gates(3 * va.width);
                     Ok(Value { sigs, width: va.width })
                 }
                 "XOR" => {
-                    let va = lower_expr(&args[0], env, nl, budget, decls, _modal, depth)?;
-                    let vb = lower_expr(&args[1], env, nl, budget, decls, _modal, depth)?;
+                    let va = lower_expr(&args[0], env, nl, decls, _modal, depth, edepth + 1)?;
+                    let vb = lower_expr(&args[1], env, nl, decls, _modal, depth, edepth + 1)?;
                     need_width(&va, &vb, *sp)?;
                     let sigs = va.sigs.iter().zip(vb.sigs.iter()).map(|(&a, &b)| nl.xor(a, b)).collect();
-                    budget.add_gates(4 * va.width);
                     Ok(Value { sigs, width: va.width })
                 }
                 "NOT" => {
-                    let va = lower_expr(&args[0], env, nl, budget, decls, _modal, depth)?;
+                    let va = lower_expr(&args[0], env, nl, decls, _modal, depth, edepth + 1)?;
                     let sigs = va.sigs.iter().map(|&a| nl.not(a)).collect();
-                    budget.add_gates(va.width);
                     Ok(Value { sigs, width: va.width })
                 }
                 "NAND" => {
-                    let va = lower_expr(&args[0], env, nl, budget, decls, _modal, depth)?;
-                    let vb = lower_expr(&args[1], env, nl, budget, decls, _modal, depth)?;
+                    let va = lower_expr(&args[0], env, nl, decls, _modal, depth, edepth + 1)?;
+                    let vb = lower_expr(&args[1], env, nl, decls, _modal, depth, edepth + 1)?;
                     need_width(&va, &vb, *sp)?;
                     let sigs = va.sigs.iter().zip(vb.sigs.iter()).map(|(&a, &b)| nl.nand(a, b)).collect();
-                    budget.add_gates(va.width);
                     Ok(Value { sigs, width: va.width })
                 }
                 "__UPDATE" => {
@@ -251,6 +286,12 @@ fn lower_expr(
                     if depth > 32 {
                         return Err(LowerError::new(*sp, "组合递归过深（循环引用？）"));
                     }
+                    // 网表规模上限：内联无记忆化，重复引用会导致 2^k 指数爆炸；
+                    // 超限时干净报错，而非 OOM / 挂死。并计入展开次数（纯透传链不增门/信号）。
+                    nl.expansions += 1;
+                    if nl.expansions > 200_000 || nl.gates.len() > MAX_NETLIST_GATES {
+                        return Err(LowerError::new(*sp, "网表规模超限（组合爆炸或循环引用？）"));
+                    }
                     // 参数求值
                     let mut arg_env = Env::new();
                     let circuit = find_circuit(decls, callee)
@@ -260,14 +301,14 @@ fn lower_expr(
                     }
                     // 逐参数求值并绑定到子环境
                     for (i, p) in circuit.params.iter().enumerate() {
-                        let v = lower_expr(&args[i], env, nl, budget, decls, _modal, depth + 1)?;
+                        let v = lower_expr(&args[i], env, nl, decls, _modal, depth + 1, edepth + 1)?;
                         if v.width != p.width.bits() {
                             return Err(LowerError::new(*sp, &format!("{} 参数 {} 宽度不匹配", callee, p.name)));
                         }
                         arg_env.insert(p.name.clone(), v);
                     }
                     // 递归展开 body
-                    let (results, _) = compile_statements(&circuit.body, &mut arg_env, nl, budget, decls, _modal, depth + 1)?;
+                    let (results, _) = compile_statements(&circuit.body, &mut arg_env, nl, decls, _modal, depth + 1)?;
                     // 多输出：逐输出生成
                     if circuit.returns.len() == 1 {
                         // 单个输出返回值
@@ -287,14 +328,14 @@ fn lower_expr(
             }
         }
         Expr::Index(e, i, sp) => {
-            let v = lower_expr(e, env, nl, budget, decls, _modal, depth)?;
+            let v = lower_expr(e, env, nl, decls, _modal, depth, edepth + 1)?;
             if *i >= v.width {
                 return Err(LowerError::new(*sp, "位索引越界"));
             }
             Ok(Value { sigs: vec![v.sigs[*i as usize]], width: 1 })
         }
         Expr::Slice(e, lo, hi, sp) => {
-            let v = lower_expr(e, env, nl, budget, decls, _modal, depth)?;
+            let v = lower_expr(e, env, nl, decls, _modal, depth, edepth + 1)?;
             if *hi >= v.width || lo > hi {
                 return Err(LowerError::new(*sp, "切片越界"));
             }
@@ -304,7 +345,7 @@ fn lower_expr(
             // 拼接 [a, b, c]：LSB 语义将第一个加在低位？按真值：concat 先高位
             let mut vals = Vec::new();
             for it in items {
-                vals.push(lower_expr(it, env, nl, budget, decls, _modal, depth)?);
+                vals.push(lower_expr(it, env, nl, decls, _modal, depth, edepth + 1)?);
             }
             let mut total = 0u32;
             for v in &vals {
@@ -318,35 +359,30 @@ fn lower_expr(
             Ok(Value { sigs, width: total })
         }
         Expr::Not(e, _sp) => {
-            let v = lower_expr(e, env, nl, budget, decls, _modal, depth)?;
+            let v = lower_expr(e, env, nl, decls, _modal, depth, edepth + 1)?;
             let sigs: Vec<usize> = v.sigs.iter().map(|&a| nl.not(a)).collect();
-            budget.add_gates(v.width);
             Ok(Value { sigs, width: v.width })
         }
         Expr::Bin(op, a, b, _sp) => {
-            let va = lower_expr(a, env, nl, budget, decls, _modal, depth)?;
-            let vb = lower_expr(b, env, nl, budget, decls, _modal, depth)?;
+            let va = lower_expr(a, env, nl, decls, _modal, depth, edepth + 1)?;
+            let vb = lower_expr(b, env, nl, decls, _modal, depth, edepth + 1)?;
             let (va, vb) = coerce(nl, &va, &vb);
             match op {
                 BinOp::And => {
                     let sigs = va.sigs.iter().zip(vb.sigs.iter()).map(|(&x, &y)| nl.and(x, y)).collect();
-                    budget.add_gates(2 * va.width);
                     Ok(Value { sigs, width: va.width })
                 }
                 BinOp::Or => {
                     let sigs = va.sigs.iter().zip(vb.sigs.iter()).map(|(&x, &y)| nl.or(x, y)).collect();
-                    budget.add_gates(3 * va.width);
                     Ok(Value { sigs, width: va.width })
                 }
                 BinOp::Xor => {
                     let sigs = va.sigs.iter().zip(vb.sigs.iter()).map(|(&x, &y)| nl.xor(x, y)).collect();
-                    budget.add_gates(4 * va.width);
                     Ok(Value { sigs, width: va.width })
                 }
                 BinOp::Add => {
                     // 加法器：逐全加器。FA = 2XOR(8) + 2AND(4) + OR(3) = 15
                     let (sums, _cout) = nl.adder(&va.sigs, &vb.sigs);
-                    budget.add_gates(15 * va.width);
                     Ok(Value { sigs: sums, width: va.width })
                 }
                 BinOp::Eq => {
@@ -358,7 +394,6 @@ fn lower_expr(
                         eq_sig = nl.and(eq_sig, xn);
                     }
                     // 门数：每 bit XOR(4)+NOT(1)+AND(2) = 7, 首个 AND 用 const 输入
-                    budget.add_gates(7 * va.width);
                     Ok(Value { sigs: vec![eq_sig], width: 1 })
                 }
                 BinOp::Ne => {
@@ -368,20 +403,18 @@ fn lower_expr(
                         let xn = nl.not(x);
                         eq_sig = nl.and(eq_sig, xn);
                     }
-                    budget.add_gates(7 * va.width);
                     let ne = nl.not(eq_sig);
-                    budget.add_gates(1);
                     Ok(Value { sigs: vec![ne], width: 1 })
                 }
             }
         }
         Expr::Ternary(c, t, e, sp) => {
-            let vc = lower_expr(c, env, nl, budget, decls, _modal, depth)?;
+            let vc = lower_expr(c, env, nl, decls, _modal, depth, edepth + 1)?;
             if vc.width != 1 {
                 return Err(LowerError::new(*sp, "条件必须为 Bit"));
             }
-            let vt = lower_expr(t, env, nl, budget, decls, _modal, depth)?;
-            let ve = lower_expr(e, env, nl, budget, decls, _modal, depth)?;
+            let vt = lower_expr(t, env, nl, decls, _modal, depth, edepth + 1)?;
+            let ve = lower_expr(e, env, nl, decls, _modal, depth, edepth + 1)?;
             need_width(&vt, &ve, *sp)?;
             // 选择器：out = (c & t) | (!c & e)  每 bit: AND2+AND2+OR3 = 7 门
             let sigs = vt
@@ -395,7 +428,6 @@ fn lower_expr(
                     nl.or(ct, ne)
                 })
                 .collect::<Vec<_>>();
-            budget.add_gates(7 * vt.width);
             Ok(Value { sigs, width: vt.width })
         }
     }
@@ -436,7 +468,6 @@ fn compile_statements(
     body: &[Stmt],
     env: &mut Env,
     nl: &mut Netlist,
-    budget: &mut ResourceBudget,
     decls: &[Decl],
     modal: Modal,
     depth: usize,
@@ -447,11 +478,15 @@ fn compile_statements(
             // 已 return 之后语句不执行（保持语义）
             break;
         }
+        // 累计门数上限：内联之外的语句体也可生成海量门（如数千条 128 位加法）→ 防 OOM
+        if nl.gates.len() > MAX_NETLIST_GATES {
+            return Err(LowerError::new(stmt_span_safe(), "网表规模超限（累计门数过多）"));
+        }
         match stmt {
             Stmt::Assign(a) => {
                 // 时序更新 <-：语义检查在调用者做。这里只记录结果（调用者注册到 next_latch）
                 // 展开 value；target 是 latch 或变量。
-                let v = lower_expr(&a.value, env, nl, budget, decls, modal, depth)?;
+                let v = lower_expr(&a.value, env, nl, decls, modal, depth, 0)?;
                 if a.targets.len() == 1 {
                     match &a.targets[0] {
                         Target::Var(name, sp) => {
@@ -484,6 +519,9 @@ fn compile_statements(
                                 Target::Var(n, _) => env.get(n).cloned().ok_or_else(|| LowerError::new(*sp, "切片目标未定义"))?,
                                 _ => return Err(LowerError::new(*sp, "不支持嵌套切片赋值")),
                             };
+                            if lo > hi || *hi >= base.width as usize {
+                                return Err(LowerError::new(*sp, "切片赋值越界"));
+                            }
                             let hold = (hi - lo) as u32 + 1;
                             if v.width != hold {
                                 return Err(LowerError::new(*sp, "切片赋值宽度不匹配"));
@@ -505,6 +543,9 @@ fn compile_statements(
                                 if w == 0 {
                                     return Err(LowerError::new(*sp, "多目标赋值宽度未知"));
                                 }
+                                if off + w > v.sigs.len() {
+                                    return Err(LowerError::new(*sp, "多目标赋值超出右值宽度"));
+                                }
                                 let slice: Vec<usize> = v.sigs[off..off + w].to_vec();
                                 env.insert(name.clone(), Value { sigs: slice, width: w as u32 });
                                 off += w;
@@ -517,12 +558,12 @@ fn compile_statements(
             Stmt::Return(exprs) => {
                 let mut vals = Vec::new();
                 for e in exprs {
-                    vals.push(lower_expr(e, env, nl, budget, decls, modal, depth)?);
+                    vals.push(lower_expr(e, env, nl, decls, modal, depth, 0)?);
                 }
                 returned = Some((vals, stmt_span_safe()));
             }
             Stmt::If(if_stmt) => {
-                let vc = lower_expr(&if_stmt.cond, env, nl, budget, decls, modal, depth)?;
+                let vc = lower_expr(&if_stmt.cond, env, nl, decls, modal, depth, 0)?;
                 if vc.width != 1 {
                     return Err(LowerError::new(if_stmt.span, "if 条件必须为 Bit"));
                 }
@@ -530,8 +571,8 @@ fn compile_statements(
                 let mut then_env = env.clone();
                 let mut else_env = env.clone();
                 // 注意：if 内的 return 不处理（原型限制：若有 return 抛出说明）
-                let (_, then_ret) = compile_statements(&if_stmt.then_body, &mut then_env, nl, budget, decls, modal, depth + 1)?;
-                let (_, else_ret) = compile_statements(&if_stmt.else_body, &mut else_env, nl, budget, decls, modal, depth + 1)?;
+                let (_, then_ret) = compile_statements(&if_stmt.then_body, &mut then_env, nl, decls, modal, depth + 1)?;
+                let (_, else_ret) = compile_statements(&if_stmt.else_body, &mut else_env, nl, decls, modal, depth + 1)?;
                 if then_ret.is_some() || else_ret.is_some() {
                     return Err(LowerError::new(if_stmt.span, "if 内 return 暂不支持（原型）"));
                 }
@@ -564,7 +605,6 @@ fn compile_statements(
                                     nl.or(ct, ne)
                                 })
                                 .collect::<Vec<_>>();
-                            budget.add_gates(8 * t.width);
                             env.insert(k, Value { sigs, width: t.width });
                         }
                         _ => {
@@ -600,8 +640,38 @@ fn circuit_lower(c: &Circuit, compiler: &mut Compiler, depth: usize, stack: Vec<
     let mut nl = Netlist::default();
     let mut budget = ResourceBudget::default();
     let mut env = Env::new();
+    // 原型以 u128 表示信号：输入/输出位宽一律 ≤128，否则仿真/验证会静默截断（假通过）。
+    for p in &c.params {
+        if p.width.bits() > 128 {
+            return Err(LowerError::new(c.span, "输入位宽 > 128 不支持（原型上限）"));
+        }
+    }
+    for p in &c.returns {
+        if p.width.bits() > 128 {
+            return Err(LowerError::new(c.span, "输出位宽 > 128 不支持（原型上限）"));
+        }
+    }
+    // 重复输出名会使 nl.outputs 覆盖 → 验证/等价读到同一信号，拒绝。
+    for (i, p) in c.returns.iter().enumerate() {
+        for q in c.returns.iter().skip(i + 1) {
+            if p.name == q.name {
+                return Err(LowerError::new(c.span, "重复的输出参数名"));
+            }
+        }
+    }
+    // 重复输入名会产生重复信号 + 冲突的 input 名（FCT IR 会丢输入），拒绝。
+    for (i, p) in c.params.iter().enumerate() {
+        for q in c.params.iter().skip(i + 1) {
+            if p.name == q.name {
+                return Err(LowerError::new(c.span, "重复的输入参数名"));
+            }
+        }
+    }
     // 参数 → 输入信号
     for p in &c.params {
+        if nl.gates.len() + p.width.bits() as usize > MAX_NETLIST_GATES {
+            return Err(LowerError::new(c.span, "输入位宽超限（Bits<N> 过大）"));
+        }
         let sigs: Vec<usize> = (0..p.width.bits()).map(|_| nl.new_sig()).collect();
         let mut gates = Vec::new();
         for (i, s) in sigs.iter().enumerate() {
@@ -613,7 +683,7 @@ fn circuit_lower(c: &Circuit, compiler: &mut Compiler, depth: usize, stack: Vec<
         env.insert(p.name.clone(), Value { sigs: sigs.clone(), width: p.width.bits() });
     }
     // 编译 body
-    let (results, _) = compile_statements(&c.body, &mut env, &mut nl, &mut budget, compiler.decls, Modal::Combinational, depth)?;
+    let (results, _) = compile_statements(&c.body, &mut env, &mut nl, compiler.decls, Modal::Combinational, depth)?;
     // 输出
     let mut output_sigs = Vec::new();
     for (i, p) in c.returns.iter().enumerate() {
@@ -651,13 +721,61 @@ fn circuit_lower(c: &Circuit, compiler: &mut Compiler, depth: usize, stack: Vec<
 
 /// 编译 state：每个 fn 独立编译为一个组合网表（输入 = latch 状态 + fn 参数）。
 fn state_lower(s: &State, compiler: &mut Compiler) -> LowerResult<Compiled> {
+    // 重复 latch 名 / fn 名会产生冲突信号与重复 FCT 产物条目，拒绝。
+    for (i, l) in s.latches.iter().enumerate() {
+        for q in s.latches.iter().skip(i + 1) {
+            if l.name == q.name {
+                return Err(LowerError::new(s.span, "重复的 latch 名"));
+            }
+        }
+    }
+    for (i, f) in s.fns.iter().enumerate() {
+        for g in s.fns.iter().skip(i + 1) {
+            if f.name == g.name {
+                return Err(LowerError::new(s.span, "重复的 fn 名"));
+            }
+        }
+    }
     let mut fns = Vec::new();
     for f in &s.fns {
         let mut nl = Netlist::default();
         let mut budget = ResourceBudget::default();
         let mut env = Env::new();
+        // 位宽 ≤128（同组合电路）
+        for l in &s.latches {
+            if l.width.bits() > 128 {
+                return Err(LowerError::new(s.span, "latch 位宽 > 128 不支持"));
+            }
+        }
+        for p in &f.params {
+            if p.width.bits() > 128 {
+                return Err(LowerError::new(f.span, "参数位宽 > 128 不支持"));
+            }
+        }
+        for p in &f.returns {
+            if p.width.bits() > 128 {
+                return Err(LowerError::new(f.span, "输出位宽 > 128 不支持"));
+            }
+        }
+        for (i, p) in f.params.iter().enumerate() {
+            for q in f.params.iter().skip(i + 1) {
+                if p.name == q.name {
+                    return Err(LowerError::new(f.span, "重复的参数名"));
+                }
+            }
+        }
+        for (i, p) in f.returns.iter().enumerate() {
+            for q in f.returns.iter().skip(i + 1) {
+                if p.name == q.name {
+                    return Err(LowerError::new(f.span, "重复的输出名"));
+                }
+            }
+        }
         // latch 状态作为输入
         for l in &s.latches {
+            if nl.gates.len() + l.width.bits() as usize > MAX_NETLIST_GATES {
+                return Err(LowerError::new(s.span, "latch 位宽超限"));
+            }
             let sigs: Vec<usize> = (0..l.width.bits()).map(|_| nl.new_sig()).collect();
             for (i, sig) in sigs.iter().enumerate() {
                 let g = Gate::Input { out: *sig, name: format!("latch_{}_{}", l.name, i) };
@@ -667,8 +785,19 @@ fn state_lower(s: &State, compiler: &mut Compiler) -> LowerResult<Compiled> {
             }
             env.insert(l.name.clone(), Value { sigs: sigs.clone(), width: l.width.bits() });
         }
+        // 参数名不得与 latch 输入前缀冲突（否则参数信号会覆盖 latch 信号 → 时序验证假通过）
+        for p in &f.params {
+            for l in &s.latches {
+                if p.name == format!("latch_{}", l.name) {
+                    return Err(LowerError::new(p.span, "参数名与保留前缀 latch_ 冲突"));
+                }
+            }
+        }
         // fn 参数
         for p in &f.params {
+            if nl.gates.len() + p.width.bits() as usize > MAX_NETLIST_GATES {
+                return Err(LowerError::new(f.span, "参数位宽超限"));
+            }
             let sigs: Vec<usize> = (0..p.width.bits()).map(|_| nl.new_sig()).collect();
             for (i, sig) in sigs.iter().enumerate() {
                 let g = Gate::Input { out: *sig, name: format!("{}_{}", p.name, i) };
@@ -681,7 +810,7 @@ fn state_lower(s: &State, compiler: &mut Compiler) -> LowerResult<Compiled> {
         // 编译 body，追踪 latch 更新
         let mut next_latch: Vec<(String, Vec<usize>)> = Vec::new();
         // 捕获 <-：这里简化：赋值给 latch 名的记录下来
-        let (results, _) = compile_fn_body_with_updates(&f.body, &mut env, &mut nl, &mut budget, compiler.decls, &mut next_latch, &s.latches)?;
+        let (results, _) = compile_fn_body_with_updates(&f.body, &mut env, &mut nl, compiler.decls, &mut next_latch, &s.latches)?;
         // 输出
         let mut output_sigs = Vec::new();
         for (i, p) in f.returns.iter().enumerate() {
@@ -720,7 +849,6 @@ fn compile_fn_body_with_updates(
     body: &[Stmt],
     env: &mut Env,
     nl: &mut Netlist,
-    budget: &mut ResourceBudget,
     decls: &[Decl],
     next_latch: &mut Vec<(String, Vec<usize>)>,
     latches: &[LatchDecl],
@@ -730,12 +858,18 @@ fn compile_fn_body_with_updates(
         if returned.is_some() {
             break;
         }
+        if nl.gates.len() > MAX_NETLIST_GATES {
+            return Err(LowerError::new(stmt_span_safe(), "网表规模超限（累计门数过多）"));
+        }
         match stmt {
             Stmt::Assign(a) => {
                 // <- 更新：目标为 latch
                 if let Expr::Call(callee, args, _) = &a.value {
                     if callee == "__UPDATE" {
-                        let v = lower_expr(&args[0], env, nl, budget, decls, Modal::Sequential, 0)?;
+                        if args.len() != 1 {
+                            return Err(LowerError::new(a.span, "__UPDATE 需要且仅需 1 个参数"));
+                        }
+                        let v = lower_expr(&args[0], env, nl, decls, Modal::Sequential, 0, 0)?;
                         if a.targets.len() != 1 {
                             return Err(LowerError::new(a.span, "<- 只能单目标"));
                         }
@@ -759,7 +893,7 @@ fn compile_fn_body_with_updates(
                     }
                 }
                 // = 赋值：普通
-                let v = lower_expr(&a.value, env, nl, budget, decls, Modal::Sequential, 0)?;
+                let v = lower_expr(&a.value, env, nl, decls, Modal::Sequential, 0, 0)?;
                 if a.targets.len() == 1 {
                     match &a.targets[0] {
                         Target::Var(name, sp) => {
@@ -778,6 +912,9 @@ fn compile_fn_body_with_updates(
                             if *i >= base.width as usize {
                                 return Err(LowerError::new(*sp, "索引赋值越界"));
                             }
+                            if v.width != 1 {
+                                return Err(LowerError::new(*sp, "位赋值右值必须为 Bit"));
+                            }
                             let mut new = base.sigs.clone();
                             new[*i] = v.sigs[0];
                             env.insert(inner_name(inner), Value { sigs: new, width: base.width });
@@ -787,7 +924,13 @@ fn compile_fn_body_with_updates(
                                 Target::Var(n, _) => env.get(n).cloned().ok_or_else(|| LowerError::new(*sp, "切片目标未定义"))?,
                                 _ => return Err(LowerError::new(*sp, "不支持嵌套切片赋值")),
                             };
+                            if lo > hi || *hi >= base.width as usize {
+                                return Err(LowerError::new(*sp, "切片赋值越界"));
+                            }
                             let _hold = (hi - lo) as u32 + 1;
+                            if v.width != _hold {
+                                return Err(LowerError::new(*sp, "切片赋值宽度不匹配"));
+                            }
                             let mut new = base.sigs.clone();
                             for (i, s) in v.sigs.iter().enumerate() {
                                 new[lo + i] = *s;
@@ -804,6 +947,9 @@ fn compile_fn_body_with_updates(
                                 if w == 0 {
                                     return Err(LowerError::new(*sp, "多目标赋值宽度未知"));
                                 }
+                                if off + w > v.sigs.len() {
+                                    return Err(LowerError::new(*sp, "多目标赋值超出右值宽度"));
+                                }
                                 let slice: Vec<usize> = v.sigs[off..off + w].to_vec();
                                 env.insert(name.clone(), Value { sigs: slice, width: w as u32 });
                                 off += w;
@@ -816,19 +962,28 @@ fn compile_fn_body_with_updates(
             Stmt::Return(exprs) => {
                 let mut vals = Vec::new();
                 for e in exprs {
-                    vals.push(lower_expr(e, env, nl, budget, decls, Modal::Sequential, 0)?);
+                    vals.push(lower_expr(e, env, nl, decls, Modal::Sequential, 0, 0)?);
                 }
                 returned = Some((vals, stmt_span_safe()));
             }
             Stmt::If(if_stmt) => {
                 // 简化：if 内不支持 latch 更新（原型），但支持组合选择
-                let vc = lower_expr(&if_stmt.cond, env, nl, budget, decls, Modal::Sequential, 0)?;
+                let vc = lower_expr(&if_stmt.cond, env, nl, decls, Modal::Sequential, 0, 0)?;
+                if vc.width != 1 {
+                    return Err(LowerError::new(if_stmt.span, "if 条件必须为 Bit"));
+                }
                 let mut then_env = env.clone();
                 let mut else_env = env.clone();
-                let (_, then_ret) = compile_fn_body_with_updates(&if_stmt.then_body, &mut then_env, nl, budget, decls, next_latch, latches)?;
-                let (_, else_ret) = compile_fn_body_with_updates(&if_stmt.else_body, &mut else_env, nl, budget, decls, next_latch, latches)?;
+                // 分支内的 <- 必须显式拒绝：直接写入 next_latch 会无视条件（静默错误时序）。
+                let mut then_upd: Vec<(String, Vec<usize>)> = Vec::new();
+                let mut else_upd: Vec<(String, Vec<usize>)> = Vec::new();
+                let (_, then_ret) = compile_fn_body_with_updates(&if_stmt.then_body, &mut then_env, nl, decls, &mut then_upd, latches)?;
+                let (_, else_ret) = compile_fn_body_with_updates(&if_stmt.else_body, &mut else_env, nl, decls, &mut else_upd, latches)?;
                 if then_ret.is_some() || else_ret.is_some() {
                     return Err(LowerError::new(if_stmt.span, "if 内 return 暂不支持"));
+                }
+                if !then_upd.is_empty() || !else_upd.is_empty() {
+                    return Err(LowerError::new(if_stmt.span, "if 分支内 <- 更新暂不支持（原型）"));
                 }
                 let all_keys: Vec<String> = {
                     let mut ks: Vec<String> = then_env.keys().cloned().collect();
@@ -858,7 +1013,6 @@ fn compile_fn_body_with_updates(
                                     nl.or(ct, ne)
                                 })
                                 .collect::<Vec<_>>();
-                            budget.add_gates(8 * t.width);
                             env.insert(k, Value { sigs, width: t.width });
                         }
                         _ => {}

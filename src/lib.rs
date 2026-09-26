@@ -13,6 +13,7 @@
 
 pub mod ast;
 pub mod equiv;
+pub mod fct;
 pub mod lexer;
 pub mod lower;
 pub mod netlist;

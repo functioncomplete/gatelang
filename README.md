@@ -12,7 +12,7 @@ M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文
 
 ```bash
 cargo build
-cargo test          # 15 个测试（11 单元 + 4 集成）
+cargo test          # 19 个测试（12 单元 + 7 集成）
 ```
 
 ## CLI
@@ -20,6 +20,9 @@ cargo test          # 15 个测试（11 单元 + 4 集成）
 ```bash
 # 编译并打印资源（门数/深度/周期）
 cargo run --quiet -- examples/adder4.gat
+
+# FCT 后端（《FCT 技术组件白皮书 v1.3》§3.3）：导出门级函数 IR / DSU 描述 / 验证电路 / guest 模板
+cargo run --quiet -- examples/stdlib_l1.gat --fct ./fct-out
 
 # spec 验证（穷举输入真值表检查前后置条件）
 cargo run --quiet -- examples/adder4_spec.gat --verify
@@ -39,6 +42,8 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 | `examples/adder4.gat` | 半加器 + 4 位加法器 | 60 门、深度 19 |
 | `examples/adder4_spec.gat` | 加法器 + spec | `--verify` 穷举 256 输入验证 post 条件 |
 | `examples/equiv.gat` | XOR 两实现 | 门级 vs 显式 NAND 展开,等价 + 真值表 spec |
+| `examples/domain_equiv.gat` | 约束域等价 | 全域不等价、约束域 `a==1&&b==1` 等价并给反例 |
+| `examples/stdlib_l1.gat` | 模板库：全加器 / Mux2 / Comparator4 | 15 / 8 / 58 门，`Gates<>` 上界强制 + spec 穷举（含 gt） |
 | `examples/srlatch.gat` | SR Latch + 计数器 | 时序状态与 latch 更新 |
 
 ## 语言要点（原型子集）

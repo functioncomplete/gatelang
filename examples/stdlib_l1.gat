@@ -2,8 +2,10 @@
 // 全部以 GateLang 源码实现，编译为 NAND 网表。
 
 // 全加器：sum = a^b^c, cout = (a&b)|(c&(a^b))
-// 门数 = 2×XOR(4) + 2×AND(2) + OR(3) = 15
-circuit FullAdder(a: Bit, b: Bit, cin: Bit) -> (sum: Bit, cout: Bit) {
+// 门数 = 2×XOR(4) + 2×AND(2) + OR(3) = 15，深度 7
+circuit FullAdder(a: Bit, b: Bit, cin: Bit) -> (sum: Bit, cout: Bit)
+    gates: Gates<15> depth: Depth<7>
+{
     ab = XOR(a, b);
     sum = XOR(ab, cin);
     ab_and = AND(a, b);
@@ -13,8 +15,10 @@ circuit FullAdder(a: Bit, b: Bit, cin: Bit) -> (sum: Bit, cout: Bit) {
 }
 
 // 2 选 1 MUX：out = sel ? a : b
-// 门数 = 2×AND(2) + OR(3) + NOT(1) = 8 每 bit
-circuit Mux2(a: Bit, b: Bit, sel: Bit) -> Bit {
+// 门数 = 2×AND(2) + OR(3) + NOT(1) = 8，深度 5
+circuit Mux2(a: Bit, b: Bit, sel: Bit) -> Bit
+    gates: Gates<8> depth: Depth<5>
+{
     sa = AND(a, sel);
     nsel = NOT(sel);
     sb = AND(b, nsel);
@@ -22,16 +26,21 @@ circuit Mux2(a: Bit, b: Bit, sel: Bit) -> Bit {
     return out;
 }
 
-// 4 位比较器：eq(相等) / gt(a>b)
-// eq = AND of XNOR；gt = 逐位从高位比较（三元用 `cond if t else e`）
-circuit Comparator4(a: Bits<4>, b: Bits<4>) -> (eq: Bit, gt: Bit) {
+// 4 位比较器：eq(相等) / gt(a>b)。58 门 / 深度 20
+// （与 NandGateLib.cmp4、HybridGate 注册规格 (58, 20) 一致，由 §gates/§depth 上界强制）
+// eq = 各位异或取或再取反；gt = 逐位从高位比较。
+// 三元语法为 `COND if THEN else ELSE`：`d3 if a[3]` 读作"当 d3 为真取 a[3]"。
+// 语义：d_i=1 表示该位不同，此时最高不同位上 a[i]=1 即 a>b。
+circuit Comparator4(a: Bits<4>, b: Bits<4>) -> (eq: Bit, gt: Bit)
+    gates: Gates<58> depth: Depth<20>
+{
     d3 = XOR(a[3], b[3]);
     d2 = XOR(a[2], b[2]);
     d1 = XOR(a[1], b[1]);
     d0 = XOR(a[0], b[0]);
     // 相等：任何位不同则不等
     eq = !(d3 | d2 | d1 | d0);
-    // 大于：最高位优先
+    // 大于：最高不同位优先；d_i=1 时取 a[i]
     gt = d3 if a[3] else (d2 if a[2] else (d1 if a[1] else (d0 if a[0] else 0)));
     return (eq, gt);
 }
@@ -51,7 +60,8 @@ spec FCT.stdlib.mux2 {
 
 spec FCT.stdlib.comparator4 {
     precondition: true;
-    postcondition: eq == ((a - b) == 0);
+    // 同时校验 eq 与 gt（此前只校验 eq，gt 的错误无法被发现）
+    postcondition: eq == ((a - b) == 0) && gt == (a > b);
     invariant: true;
-    edge_cases: [a=0,b=0, a=15,b=0, a=8,b=8, a=1,b=15];
+    edge_cases: [a=0,b=0, a=15,b=0, a=8,b=8, a=1,b=15, a=5,b=4, a=4,b=5];
 }

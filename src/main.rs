@@ -6,6 +6,7 @@
 //!   gatelang <file.gat> --check-equiv A B  检查 A 与 B 组合电路等价
 //!   gatelang <file.gat> --check-equiv A B --domain "expr"   在约束输入域内检查等价
 //!   gatelang <file.gat> --sim NAME a b     模拟组合电路（十进制输入）
+//!   gatelang <file.gat> --fct [DIR]        FCT 后端：导出门级 IR / DSU 描述 / 验证电路 / guest 模板
 
 use std::process::ExitCode;
 
@@ -38,7 +39,13 @@ fn main() -> ExitCode {
     };
 
     let mut compiler = Compiler::new(&decls);
-    let compiled = compiler.compile_all();
+    let compiled = match compiler.compile_all() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("编译错误: {e}");
+            return ExitCode::from(1);
+        }
+    };
 
     // 默认：资源报告
     println!("== 编译产物 ==");
@@ -49,13 +56,18 @@ fn main() -> ExitCode {
     if let Some(pos) = args.iter().position(|a| a == "--check-equiv") {
         let a_name = args.get(pos + 1).cloned().unwrap_or_default();
         let b_name = args.get(pos + 2).cloned().unwrap_or_default();
+        if a_name.is_empty() || b_name.is_empty() {
+            println!("--check-equiv 需要两个电路名：--check-equiv NAME_A NAME_B");
+            return ExitCode::from(2);
+        }
         // 约束域：--domain "expr"（全局选项，可出现在任意位置）
         let domain = args
             .iter()
             .position(|a| a == "--domain")
             .and_then(|p| args.get(p + 1).cloned());
-        let a = compiled.iter().find(|c| sig(c).starts_with(&a_name));
-        let b = compiled.iter().find(|c| sig(c).starts_with(&b_name));
+        // 精确匹配电路名（name 后紧跟 '('），避免前缀歧义 / 空名匹配首例
+        let a = compiled.iter().find(|c| sig(c).starts_with(&format!("{a_name}(")));
+        let b = compiled.iter().find(|c| sig(c).starts_with(&format!("{b_name}(")));
         match (a, b) {
             (Some(a), Some(b)) => match check_equiv_domain(a, b, domain.as_deref()) {
                 Ok((true, _)) => {
@@ -97,13 +109,31 @@ fn main() -> ExitCode {
         }
         println!("  ✓ 全部满足规范");
     }
+    // FCT 后端（《FCT 技术组件白皮书 v1.3》§3.3）：
+    // 输出门级函数 IR / DSU 描述文件 / 验证电路 / guest 模板 / manifest。
+    if let Some(pos) = args.iter().position(|a| a == "--fct") {
+        let out = args
+            .get(pos + 1)
+            .filter(|s| !s.starts_with("--"))
+            .cloned()
+            .unwrap_or_else(|| "fct-out".to_string());
+        if let Err(e) = gatelang::fct::emit(&compiled, &out, &args[1]) {
+            eprintln!("FCT 后端失败: {e}");
+            return ExitCode::from(1);
+        }
+    }
     // 模拟
     if let Some(pos) = args.iter().position(|a| a == "--sim") {
         let name = args.get(pos + 1).cloned().unwrap_or_default();
-        let c = compiled.iter().find(|c| sig(c).starts_with(&name)).cloned();
+        if name.is_empty() {
+            println!("--sim 需要电路名：--sim NAME [vals...]");
+            return ExitCode::from(2);
+        }
+        let c = compiled.iter().find(|c| sig(c).starts_with(&format!("{name}("))).cloned();
         match c {
             Some(gatelang::lower::Compiled::Combinational { inputs, outputs, netlist, .. }) => {
-                let vals: Vec<u128> = args[pos + 2..]
+                let rest: &[String] = if pos + 2 <= args.len() { &args[pos + 2..] } else { &[] };
+                let vals: Vec<u128> = rest
                     .iter()
                     .filter_map(|s| u128::from_str_radix(s, 10).ok())
                     .collect();

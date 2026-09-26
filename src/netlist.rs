@@ -3,7 +3,7 @@
 //! 语义保持编译的最终形态（白皮书 v2.1 §7.2）：所有高级结构
 //! 展开为 NAND 门（组合）与 LATCH 触发器（时序）的网表。
 //! 本模块同时提供 NAND 原语库：每个基本逻辑结构 → NAND 门的展开，
-//! 展开恒以真实 NAND 计数（NOT=1, AND=2, OR=3, XOR=5, FA=9, MUX=4）。
+//! 展开恒以真实 NAND 计数（NOT=1, AND=2, OR=3, XOR=4, 半加器=5, 全加器=15）。
 
 use std::collections::HashMap;
 
@@ -35,6 +35,8 @@ pub struct Netlist {
     pub max_sig: usize,
     /// 追踪每个信号的最深组合路径（用于 depth 计算）
     pub depths: HashMap<Sig, u32>,
+    /// 结构内联展开次数（用于封顶纯透传链的 2^n 爆炸：它不增加门/信号）
+    pub expansions: usize,
 }
 
 impl Netlist {
@@ -83,15 +85,14 @@ impl Netlist {
         self.not(n)
     }
 
-    /// OR(a,b) = NOT(AND(NOT a, NOT b))，NOT(a)=1 + NOT(b)=1 + NAND=1 + NOT=1 = 4? 
-    /// 实际 OR = NAND(NAND(a,a), NAND(b,b)) → NAND(a,a)=1, NAND(b,b)=1, 再 NAND 一个 = 3 门。
+    /// OR(a,b) = NAND(NAND(a,a), NAND(b,b))：NAND(a,a)=1 + NAND(b,b)=1 + NAND=1 = 3 门。
     pub fn or(&mut self, a: Sig, b: Sig) -> Sig {
         let na = self.nand(a, a);
         let nb = self.nand(b, b);
         self.nand(na, nb)
     }
 
-    /// XOR(a,b)，5 门（标准 NAND 实现）。
+    /// XOR(a,b)，4 门（t=NAND(a,b)；NAND(a,t)+NAND(b,t)+NAND(·,·)）。
     pub fn xor(&mut self, a: Sig, b: Sig) -> Sig {
         let t = self.nand(a, b);
         let lt = self.nand(a, t);
@@ -228,5 +229,19 @@ mod tests {
         let s = nl.stats();
         assert_eq!(s.nand_count, 60);
         let _ = cout;
+    }
+
+    #[test]
+    fn vector_ops_match_scalar_counts() {
+        // 位向量原语（not/and/or/xor_vec）逐位展开，门数应等于标量原语 × 位宽。
+        let mut nl = Netlist::default();
+        let a: Vec<Sig> = (0..2).map(|i| nl.add_input(&format!("a{i}"))).collect();
+        let b: Vec<Sig> = (0..2).map(|i| nl.add_input(&format!("b{i}"))).collect();
+        assert_eq!(nl.not_vec(&a).len(), 2);
+        assert_eq!(nl.and_vec(&a, &b).len(), 2);
+        assert_eq!(nl.or_vec(&a, &b).len(), 2);
+        assert_eq!(nl.xor_vec(&a, &b).len(), 2);
+        // 2×(NOT1 + AND2 + OR3 + XOR4) = 2×10 = 20
+        assert_eq!(nl.stats().nand_count, 20);
     }
 }

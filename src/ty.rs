@@ -40,21 +40,6 @@ pub struct ResourceBudget {
 }
 
 impl ResourceBudget {
-    pub fn add_gates(&mut self, n: u32) {
-        self.gates += n;
-    }
-    /// 组合路径深度叠加：凹坑取 max。
-    pub fn add_depth(&mut self, sibling_depth: u32) {
-        if sibling_depth > self.depth {
-            self.depth = sibling_depth;
-        }
-    }
-    pub fn add_cycles(&mut self, n: u32) {
-        self.cycles += n;
-    }
-    pub fn add_latches(&mut self, n: u32) {
-        self.latches += n;
-    }
     /// 检查所有声明上界。返回违规列表（空 = 通过）。
     pub fn check_bounds(&self, decls: &[ResourceBound]) -> Vec<String> {
         let mut errs = Vec::new();

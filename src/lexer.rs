@@ -172,7 +172,7 @@ impl<'a> Lexer<'a> {
         (value, text, sp)
     }
 
-    pub fn tokenize(mut self) -> Vec<Token> {
+    pub fn tokenize(mut self) -> Result<Vec<Token>, String> {
         let mut out = Vec::new();
         loop {
             self.skip_ws_and_comments();
@@ -266,18 +266,18 @@ impl<'a> Lexer<'a> {
                     out.push(Token { tok: Tok::DotDot, span: sp });
                 }
                 b'.' => { self.bump(); out.push(Token { tok: Tok::Dot, span: sp }); }
-                _ => {
-                    // 跳过未知字符（保守容错）
-                    self.bump();
+                other => {
+                    // 未知字符必须报错：静默跳过会悄悄改变语义（如 `y == ~a` 被当作 `y == a`）
+                    return Err(format!("词法错误: 未知字符 '{}' @ {:?}", other as char, sp));
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 
 /// 便捷：将源码直接转为 Token 向量。
-pub fn tokenize(src: &str) -> Vec<Token> {
+pub fn tokenize(src: &str) -> Result<Vec<Token>, String> {
     Lexer::new(src).tokenize()
 }
 
@@ -292,7 +292,7 @@ mod tests {
             y = NAND(a, b)
             return y
         }"#;
-        let toks = tokenize(src);
+        let toks = tokenize(src).unwrap();
         assert!(toks.iter().any(|t| t.tok == Tok::Circuit));
         assert!(toks.iter().any(|t| t.tok == Tok::Ident("XOR".into())));
         assert!(toks.iter().any(|t| t.tok == Tok::Arrow));
@@ -302,7 +302,7 @@ mod tests {
     #[test]
     fn lexes_latch_update_and_bits() {
         let src = "state C { latch v: Bits<8> = 0\n fn f(x: Bit) -> Bit { v <- v } }";
-        let toks = tokenize(src);
+        let toks = tokenize(src).unwrap();
         assert!(toks.iter().any(|t| t.tok == Tok::State));
         assert!(toks.iter().any(|t| t.tok == Tok::Latch));
         assert!(toks.iter().any(|t| t.tok == Tok::Update));
@@ -312,10 +312,17 @@ mod tests {
     #[test]
     fn lexes_ops() {
         let src = "a -> b <- c == d != e && f";
-        let toks = tokenize(src);
+        let toks = tokenize(src).unwrap();
         assert!(toks.iter().any(|t| t.tok == Tok::Arrow));
         assert!(toks.iter().any(|t| t.tok == Tok::Update));
         assert!(toks.iter().any(|t| t.tok == Tok::EqEq));
         assert!(toks.iter().any(|t| t.tok == Tok::Ne));
+    }
+
+    #[test]
+    fn rejects_unknown_characters() {
+        // 未知字符应报错，而非静默跳过（否则会悄悄改变语义）
+        assert!(tokenize("y == ~a").is_err());
+        assert!(tokenize("y = a @ b").is_err());
     }
 }

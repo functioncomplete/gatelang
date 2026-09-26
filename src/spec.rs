@@ -28,9 +28,22 @@ pub enum SpecExpr {
 
 /// 解析 spec 表达式。
 pub fn parse_spec(text: &str) -> Result<SpecExpr, String> {
-    let toks = tokenize_spec(text);
-    let mut p = SpecParser { toks, pos: 0 };
+    let toks = tokenize_spec(text)?;
+    // token 总数上限：既防止超长表达式，也保证 AST 规模有界
+    // （否则深层 Box 链在 eval / drop 时递归溢出栈）。
+    if toks.len() > 2000 {
+        return Err(format!("spec: 表达式过长（token {} > 2000）", toks.len()));
+    }
+    let mut p = SpecParser { toks, pos: 0, depth: 0 };
     let e = p.parse_or()?;
+    // 必须消费全部 token：否则不支持的运算符/字面量会被静默丢弃，
+    // 导致 postcondition 被削弱成恒真（例如 `y == a ^ b` 被截成 `y == a`）。
+    if p.pos != p.toks.len() {
+        return Err(format!(
+            "spec: 表达式后存在多余 token（疑似不支持的运算符或字面量）: {:?}",
+            p.toks.get(p.pos)
+        ));
+    }
     Ok(e)
 }
 
@@ -70,7 +83,7 @@ enum Spt {
     RParen,
 }
 
-fn tokenize_spec(src: &str) -> Vec<Spt> {
+fn tokenize_spec(src: &str) -> Result<Vec<Spt>, String> {
     let b = src.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -83,7 +96,11 @@ fn tokenize_spec(src: &str) -> Vec<Spt> {
                 while i < b.len() && (b[i] as char).is_ascii_digit() {
                     i += 1;
                 }
-                let mut v: u128 = src[start..i].parse().unwrap_or(0);
+                let mut v: u128 = match src[start..i].parse() {
+                    Ok(x) => x,
+                    // 溢出 u128 时明确报错（此前 unwrap_or(0) 会静默变 0 → 假通过）
+                    Err(_) => return Err(format!("spec: 数值字面量超出 u128: {}", &src[start..i])),
+                };
                 // 处理 a^b 幂（原型仅支持 2^N / MAX_UINT）
                 if i + 1 < b.len() && b[i] == b'^' {
                     // 形如 2^256
@@ -92,7 +109,11 @@ fn tokenize_spec(src: &str) -> Vec<Spt> {
                     while i < b.len() && (b[i] as char).is_ascii_digit() {
                         i += 1;
                     }
-                    let exp: u32 = src[start2..i].parse().unwrap_or(0);
+                    let exp: u32 = match src[start2..i].parse() {
+                        Ok(x) => x,
+                        // 指数溢出 u32 时明确报错（此前 unwrap_or(0) → 2^0=1 假通过）
+                        Err(_) => return Err(format!("spec: 指数超出 u32: {}", &src[start2..i])),
+                    };
                     v = v.checked_pow(exp).unwrap_or(u128::MAX);
                     out.push(Spt::Num(v));
                 } else {
@@ -105,8 +126,12 @@ fn tokenize_spec(src: &str) -> Vec<Spt> {
                     i += 1;
                 }
                 let s = &src[start..i];
-                if s == "MAX_UINT" || s == "max" {
+                if s == "MAX_UINT" {
                     out.push(Spt::Num(u128::MAX));
+                } else if s == "true" {
+                    out.push(Spt::Num(1));
+                } else if s == "false" {
+                    out.push(Spt::Num(0));
                 } else {
                     out.push(Spt::Ident(s.to_string()));
                 }
@@ -120,30 +145,34 @@ fn tokenize_spec(src: &str) -> Vec<Spt> {
                 i += 1;
             }
             '&' | '|' | '!' | '=' | '<' | '>' | '+' | '-' | '*' | '%' => {
-                // 双字符操作符
+                // 双字符操作符。用 src.get 避免在多字节 UTF-8 边界上切片 panic。
                 if i + 1 < b.len() {
-                    let two = &src[i..i + 2];
-                    match two {
-                        "<=" | ">=" | "==" | "!=" | "&&" | "||" => {
-                            out.push(Spt::Op(two.to_string()));
-                            i += 2;
-                            continue;
+                    if let Some(two) = src.get(i..i + 2) {
+                        match two {
+                            "<=" | ">=" | "==" | "!=" | "&&" | "||" => {
+                                out.push(Spt::Op(two.to_string()));
+                                i += 2;
+                                continue;
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
                 out.push(Spt::Op(c.to_string()));
                 i += 1;
             }
-            _ => i += 1,
+            // 未知字符不得静默跳过：否则不支持的运算符（如 `~`/`^`）会被丢弃，
+            // 使 postcondition 被悄悄削弱成恒真（假通过）。
+            other => return Err(format!("spec: 非法字符 '{}'", other)),
         }
     }
-    out
+    Ok(out)
 }
 
 struct SpecParser {
     toks: Vec<Spt>,
     pos: usize,
+    depth: usize,
 }
 
 impl SpecParser {
@@ -159,8 +188,13 @@ impl SpecParser {
 
     fn parse_or(&mut self) -> Result<SpecExpr, String> {
         let mut l = self.parse_and()?;
+        let mut n = 0u32;
         while let Some(Spt::Op(op)) = self.peek() {
             if op == "||" {
+                n += 1;
+                if n > 256 {
+                    return Err("spec: 表达式过长（运算项 >256）".into());
+                }
                 self.bump();
                 let r = self.parse_and()?;
                 l = SpecExpr::Or(Box::new(l), Box::new(r));
@@ -173,8 +207,13 @@ impl SpecParser {
 
     fn parse_and(&mut self) -> Result<SpecExpr, String> {
         let mut l = self.parse_cmp()?;
+        let mut n = 0u32;
         while let Some(Spt::Op(op)) = self.peek() {
             if op == "&&" {
+                n += 1;
+                if n > 256 {
+                    return Err("spec: 表达式过长（运算项 >256）".into());
+                }
                 self.bump();
                 let r = self.parse_cmp()?;
                 l = SpecExpr::And(Box::new(l), Box::new(r));
@@ -187,6 +226,7 @@ impl SpecParser {
 
     fn parse_cmp(&mut self) -> Result<SpecExpr, String> {
         let mut l = self.parse_add()?;
+        let mut n = 0u32;
         loop {
             let op = match self.peek() {
                 Some(Spt::Op(o)) => o.clone(),
@@ -194,6 +234,10 @@ impl SpecParser {
             };
             match op.as_str() {
                 "<=" | ">=" | "==" | "!=" | "<" | ">" => {
+                    n += 1;
+                    if n > 256 {
+                        return Err("spec: 表达式过长（运算项 >256）".into());
+                    }
                     self.bump();
                     let r = self.parse_add()?;
                     l = match op.as_str() {
@@ -213,6 +257,7 @@ impl SpecParser {
 
     fn parse_add(&mut self) -> Result<SpecExpr, String> {
         let mut l = self.parse_mul()?;
+        let mut n = 0u32;
         loop {
             let op = match self.peek() {
                 Some(Spt::Op(o)) => o.clone(),
@@ -220,6 +265,10 @@ impl SpecParser {
             };
             match op.as_str() {
                 "+" | "-" => {
+                    n += 1;
+                    if n > 256 {
+                        return Err("spec: 表达式过长（运算项 >256）".into());
+                    }
                     self.bump();
                     let r = self.parse_mul()?;
                     l = if op == "+" {
@@ -236,16 +285,25 @@ impl SpecParser {
 
     fn parse_mul(&mut self) -> Result<SpecExpr, String> {
         let mut l = self.parse_unary()?;
+        let mut n = 0u32;
         loop {
             let op = match self.peek() {
                 Some(Spt::Op(o)) => o.clone(),
                 _ => break,
             };
             if op == "*" {
+                n += 1;
+                if n > 256 {
+                    return Err("spec: 表达式过长（运算项 >256）".into());
+                }
                 self.bump();
                 let r = self.parse_unary()?;
                 l = SpecExpr::Mul(Box::new(l), Box::new(r));
             } else if op == "%" {
+                n += 1;
+                if n > 256 {
+                    return Err("spec: 表达式过长（运算项 >256）".into());
+                }
                 self.bump();
                 let r = self.parse_unary()?;
                 l = SpecExpr::Mod(Box::new(l), Box::new(r));
@@ -262,15 +320,27 @@ impl SpecParser {
             _ => String::new(),
         };
         if op == "!" {
+            // 一元 ! 亦为递归入口，须计入深度（否则数千层 ! 会栈溢出 abort）。
+            self.depth += 1;
+            if self.depth > 128 {
+                self.depth -= 1;
+                return Err("spec: 表达式嵌套过深（>128）".into());
+            }
             self.bump();
             let e = self.parse_unary()?;
+            self.depth -= 1;
             return Ok(SpecExpr::Not(Box::new(e)));
         }
         self.parse_primary()
     }
 
     fn parse_primary(&mut self) -> Result<SpecExpr, String> {
-        match self.bump() {
+        self.depth += 1;
+        if self.depth > 128 {
+            self.depth -= 1;
+            return Err("spec: 表达式嵌套过深（>128）".into());
+        }
+        let r = match self.bump() {
             Some(Spt::Num(n)) => Ok(SpecExpr::Num(n)),
             Some(Spt::Ident(s)) => Ok(SpecExpr::Var(s)),
             Some(Spt::LParen) => {
@@ -282,7 +352,9 @@ impl SpecParser {
                 }
             }
             other => Err(format!("spec: 意外 token {:?}", other)),
-        }
+        };
+        self.depth -= 1;
+        r
     }
 }
 

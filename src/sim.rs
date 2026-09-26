@@ -31,12 +31,17 @@ pub fn eval_netlist(nl: &Netlist, inputs: &HashMap<String, u128>) -> HashMap<Str
 fn eval_all(nl: &Netlist, inputs: &HashMap<String, u128>) -> HashMap<usize, bool> {
     // 已解析的信号值
     let mut vals: HashMap<usize, bool> = HashMap::new();
-    // 输入：按位展开
-    for (name, v) in inputs {
-        for i in 0..64u32 {
-            let key = format!("{name}_{i}");
-            if nl.inputs.contains_key(&key) {
-                vals.insert(nl.inputs[&key], ((v >> i) & 1) == 1);
+    // 输入：按位展开。直接遍历网表输入（键形如 name_i），避免对每个输入名做 128 次
+    // 字符串格式化 + 哈希查找（2^20 次求值下会退化成数十亿次分配而挂死）。
+    for (key, sig) in &nl.inputs {
+        if let Some(us) = key.rfind('_') {
+            let base = &key[..us];
+            if let Ok(bit) = key[us + 1..].parse::<u32>() {
+                if bit < 128 {
+                    if let Some(v) = inputs.get(base) {
+                        vals.insert(*sig, (v >> bit) & 1 == 1);
+                    }
+                }
             }
         }
     }
@@ -75,20 +80,14 @@ pub fn run_state(
     let mut outputs = Vec::new();
     for _ in 0..cycles {
         // 装配输入：latch 状态 + fn 参数
+        // eval_all 期望“基名 → 位模式”的映射（它自行展开 name_i），
+        // 故此处按基名（latch_<k> / 参数名）插入完整值，而非逐位展开。
         let mut full: HashMap<String, u128> = HashMap::new();
         for (k, v) in &state {
-            for i in 0..64u32 {
-                if f.netlist.inputs.contains_key(&format!("latch_{k}_{i}")) {
-                    full.insert(format!("latch_{k}_{i}"), (*v >> i) & 1);
-                }
-            }
+            full.insert(format!("latch_{k}"), *v);
         }
         for (k, v) in fn_inputs {
-            for i in 0..64u32 {
-                if f.netlist.inputs.contains_key(&format!("{k}_{i}")) {
-                    full.insert(format!("{k}_{i}"), (*v >> i) & 1);
-                }
-            }
+            full.insert(k.clone(), *v);
         }
         let vals = eval_all(&f.netlist, &full);
         // 收集输出（从内部信号值重建输出名 → bool）
@@ -103,7 +102,7 @@ pub fn run_state(
         for (lname, sigs) in &f.next_latch_sigs {
             let mut v = 0u128;
             for (i, sig) in sigs.iter().enumerate() {
-                if vals.get(sig).copied().unwrap_or(false) {
+                if i < 128 && vals.get(sig).copied().unwrap_or(false) {
                     v |= 1 << i;
                 }
             }
@@ -131,7 +130,7 @@ pub fn sim_combinational(
         let mut v = 0u128;
         for b in 0..p.width.bits() {
             let key = format!("{}_{}", p.name, b);
-            if res.get(&key).copied().unwrap_or(false) {
+            if b < 128 && res.get(&key).copied().unwrap_or(false) {
                 v |= 1 << b;
             }
         }
