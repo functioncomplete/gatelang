@@ -146,8 +146,17 @@ impl Netlist {
 
     /// N 位加法器（a+b，进位输出丢弃时忽略 cout）。
     pub fn adder(&mut self, a: &[Sig], b: &[Sig]) -> (Vec<Sig>, Sig) {
+        let cin = self.add_const(0);
+        self.adder_cin(a, b, cin)
+    }
+
+    /// N 位加法器，带进位输入。
+    ///
+    /// **必须用单条进位链**：把 `a + ~b + 1` 拆成两次加法会丢掉第一次的进位，
+    /// 使"有无借位"判断错误（比较器会给出错误结果）。
+    pub fn adder_cin(&mut self, a: &[Sig], b: &[Sig], cin: Sig) -> (Vec<Sig>, Sig) {
         let mut sums = Vec::with_capacity(a.len());
-        let mut carry = self.add_const(0);
+        let mut carry = cin;
         for i in 0..a.len() {
             let (s, c) = self.full_adder(a[i], b[i], carry);
             sums.push(s);

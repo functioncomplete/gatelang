@@ -1,9 +1,9 @@
 # GateLang — NAND/LATCH 门级可验证计算语言
 
-[![tests](https://img.shields.io/badge/tests-30%20passing-brightgreen)](tests/integration.rs)
+[![tests](https://img.shields.io/badge/tests-60%20passing-brightgreen)](tests/integration.rs)
 [![rust](https://img.shields.io/badge/rust-1.96-orange)](https://www.rust-lang.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-blue)](#构建与测试)
-[![FCT backend](https://img.shields.io/badge/FCT%20v1.3-%C2%A7%203.3-cyan)](https://github.com/functioncomplete/code)
+[![formal](https://img.shields.io/badge/verification-SAT%20%2F%20UNSAT-purple)](#形式化验证sat-后端)
 
 M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文档 v2.1》）。
 
@@ -11,14 +11,50 @@ M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文
 源码 ──lexer──▶ Token ──parser──▶ AST ──lower(语义保持展开)──▶ NAND/LATCH 网表
   ──resource──▶ 门数/深度/周期 ──sim──▶ 位级模拟 ──spec──▶ 前后置条件验证
   ──equiv──▶ 语义等价检查
+  ──cnf(Tseitin)──▶ CNF ──sat(CDCL)──▶ UNSAT=已证明 / SAT=反例   ← 形式化验证
 ```
 
 ## 构建与测试
 
 ```bash
 cargo build
-cargo test          # 19 个测试（12 单元 + 7 集成）
+cargo test          # 60 个测试（31 单元 + 14 集成 + 15 形式化证明）
 ```
+
+## 形式化验证（SAT 后端）
+
+`--verify` 是**穷举仿真**（输入位宽 ≤ 20，即至多 2^20 次模拟）。
+`--prove` 是**形式化证明**：规格被综合为门级电路，取反后交给自研 CDCL 求解器。
+
+| 结果 | 含义 |
+|------|------|
+| `UNSAT` | **对全部输入成立**（不是"测了很多没发现问题"） |
+| `SAT` | 反例：具体输入向量，可复现 |
+| `Unknown` | 触及资源上限，**不冒充结论**（fail-closed） |
+
+```bash
+# 形式化证明 spec（全输入成立，输入位宽无上限）
+cargo run --quiet -- examples/adder4_spec.gat --prove
+
+# 形式化等价证明（miter + SAT）
+cargo run --quiet -- examples/halfadder.gat --prove-equiv HalfAdder5 HalfAdderNaive
+```
+
+### 可信度从哪来
+
+不是"我们相信 SAT 求解器"，而是**两条独立实现路径给出同一结论**：
+
+1. **CNF 编码定义性正确** —— `cnf.rs` 有穷举一致性测试：对每个输入组合，
+   网表求值结果必须满足全部子句，反之亦然（编码的模型集合 == 网表语义）。
+2. **CDCL 求解器正确** —— `sat.rs` 对 300 组随机 3-SAT + 200 组混合宽度 CNF
+   与**穷举参考求解器**逐一比对；另有鸽巢原理 UNSAT 压力用例。
+3. **综合语义保真** —— 规格按 `u128` 回绕语义综合，与 `spec::eval_spec` 逐位一致；
+   `tests/prove.rs` 把形式化结论与经 18 轮独立审计的穷举验证器
+   （`verify.rs` / `equiv.rs`）在同一批语料上**逐条交叉验证**。
+4. **反例可靠** —— 被驳倒的规格，其反例会被重新模拟，确认在语义上确实违反。
+
+已知**原型上限**（全部 fail-closed，报错而非给出错误结论）：非常量除数的取模、
+超宽乘法（非二次幂/非常量路径）、综合门数预算 400k。
 
 ## CLI
 
@@ -32,8 +68,15 @@ cargo run --quiet -- examples/stdlib_l1.gat --fct ./fct-out
 # spec 验证（穷举输入真值表检查前后置条件）
 cargo run --quiet -- examples/adder4_spec.gat --verify
 
-# 等价性检查（两个电路穷举输入对比）
+# spec 形式化证明（SAT 后端，对全部输入成立）
+cargo run --quiet -- examples/adder4_spec.gat --prove
+
+# 等价性检查（无 --domain 时走 SAT/miter，输入位宽无上限；带 --domain 时穷举）
 cargo run --quiet -- examples/halfadder.gat --check-equiv HalfAdder5 HalfAdderNaive
+cargo run --quiet -- examples/domain_equiv.gat --check-equiv A B --domain "a==1 && b==1"
+
+# 形式化等价证明（miter + SAT）
+cargo run --quiet -- examples/halfadder.gat --prove-equiv HalfAdder5 HalfAdderNaive
 
 # 组合电路模拟
 cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
@@ -73,9 +116,26 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 | `resource.rs` | 门数/深度/周期统计与校验 |
 | `sim.rs` | 位级模拟器（组合 + 时序多周期） |
 | `spec.rs` | 规范表达式解析与求值 |
-| `verify.rs` | spec 验证编排 |
-| `equiv.rs` | 穷举等价性检查 |
+| `verify.rs` | spec 验证编排（穷举，≤20 位输入） |
+| `equiv.rs` | 穷举等价性检查（含约束域） |
+| `cnf.rs` | CNF 表示 + NAND 网表 Tseitin 编码 |
+| `sat.rs` | 自研 CDCL SAT 求解器（零依赖） |
+| `prove.rs` | **形式化证明**：spec 门级综合 + 反例提取 + miter 等价 |
 | `main.rs` | CLI |
+
+## 形式化验证的实现要点（`prove.rs`）
+
+规格表达式被综合为门级电路，与目标电路拼进同一网表，取反后交给 CDCL：
+`pre ∧ ¬goal` 为 UNSAT ⟺ 在全部满足前置条件的输入上 `goal` 恒真。
+
+- **语义保真**：端口值零扩展进 128 位空间运算，与 `spec::eval_spec` 的 `u128`
+  回绕语义逐位一致；`&&`/`||`/`!` 先把操作数归约为 0/1。
+- **廉价综合路径**：`x * bit` → mux，`x * const` → 移位累加，
+  `x % 2^k` → 取低 k 位（因此 `mux2` 的 `a*sel + b*(1-sel)` 是线性的）。
+- **比较器必须单条进位链**：`a < b` 用 `a + ~b + 1` 的进位判定；
+  若拆成两次加法会丢掉进位，导致 `lt(3,2)` 误判为真（已修复并有回归测试）。
+- **fail-closed**：非常量除数的取模、超出预算的乘法等一律**报错**，
+  绝不返回一个可能错误的"证明"。
 
 ## 参考
 

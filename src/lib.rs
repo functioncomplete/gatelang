@@ -12,13 +12,16 @@
 //! 独立 crate 拆分见工作区结构文档）。所有代码零外部依赖。
 
 pub mod ast;
+pub mod cnf;
 pub mod equiv;
 pub mod fct;
 pub mod lexer;
 pub mod lower;
 pub mod netlist;
 pub mod parser;
+pub mod prove;
 pub mod resource;
+pub mod sat;
 pub mod sim;
 pub mod spec;
 pub mod ty;
