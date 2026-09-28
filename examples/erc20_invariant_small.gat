@@ -1,0 +1,30 @@
+// ============================================================================
+// N = 4 账户的不变量保持（Bits<8>）—— 独立文件，便于快速回归
+// ============================================================================
+//
+// 与 `erc20_invariant.gat` 的 `ERC20Step2` 同构，只是账户数更多。
+// 单独成文件是因为 256 位版本的两条证明约需 9 分钟，不应拖慢常规测试。
+//
+// 这里证明的是：`Σ(4 个余额) == totalSupply` 由 transfer 保持
+// （对全部 2^48 组输入成立，穷举不可行）。
+
+// ---------------------------------------------------------------------------
+// N = 4 账户的不变量保持（在 Bits<8> 下可判定）
+//
+// 与 `ERC20Step2` 同构，只是账户数更多。列在这里是为了说明：
+// **账户数**本身不是障碍（Bits<8> 下 4 秒即证），障碍是"多项求和 + 高宽度"。
+// ---------------------------------------------------------------------------
+circuit ERC20Step4Small(
+    b0: Bits<8>, b1: Bits<8>, b2: Bits<8>, b3: Bits<8>, total: Bits<8>, amount: Bits<8>
+) -> (violation: Bit) {
+    invBefore = (b0 + b1 + b2 + b3) == total;
+    invAfter = (((b0 - amount) + (b1 + amount)) + b2 + b3) == total;
+    violation = AND(invBefore, NOT(invAfter));
+    return violation;
+}
+
+spec FCT.erc20.ERC20Step4Small {
+    precondition: true;
+    postcondition: violation == 0;
+    invariant: true;
+}

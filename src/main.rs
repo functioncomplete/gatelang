@@ -232,6 +232,16 @@ fn main() -> ExitCode {
         let c = compiled.iter().find(|c| sig(c).starts_with(&format!("{name}("))).cloned();
         match c {
             Some(gatelang::lower::Compiled::Combinational { inputs, outputs, netlist, .. }) => {
+                // 模拟器用 u128 表示端口值：位宽 > 128 时必须拒绝，
+                // 否则高位会被静默当作 0（假结果）。
+                if let Some(p) = inputs.iter().find(|p| p.width.bits() > 128) {
+                    println!(
+                        "模拟不支持位宽 > 128 的端口（{}: Bits<{}>）；请用 --prove 做形式化验证",
+                        p.name,
+                        p.width.bits()
+                    );
+                    return ExitCode::from(2);
+                }
                 let rest: &[String] = if pos + 2 <= args.len() { &args[pos + 2..] } else { &[] };
                 let vals: Vec<u128> = rest
                     .iter()

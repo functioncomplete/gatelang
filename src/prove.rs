@@ -446,7 +446,41 @@ fn port_env(nl: &Netlist, compiled: &Compiled) -> Result<HashMap<String, Vec<Sig
     Ok(env)
 }
 
-/// 从模型还原输入参数值。
+/// 把模型中的一段位按 LSB-first 渲染为 `0x…` 十六进制。
+///
+/// **不做 u128 截断** —— 256 位端口的反例必须完整显示，否则会误导排障。
+fn render_bits(
+    var_of: impl Fn(u32) -> Option<crate::cnf::Var>,
+    model: &[bool],
+    width: u32,
+) -> String {
+    let mut nibbles: Vec<u8> = Vec::new();
+    let mut bit = 0u32;
+    while bit < width {
+        let mut v = 0u8;
+        for k in 0..4 {
+            if bit + k < width {
+                if let Some(var) = var_of(bit + k) {
+                    if model.get(var as usize).copied().unwrap_or(false) {
+                        v |= 1 << k;
+                    }
+                }
+            }
+        }
+        nibbles.push(v);
+        bit += 4;
+    }
+    while nibbles.len() > 1 && *nibbles.last().unwrap() == 0 {
+        nibbles.pop();
+    }
+    let mut s = String::from("0x");
+    for n in nibbles.iter().rev() {
+        s.push(std::char::from_digit(*n as u32, 16).unwrap());
+    }
+    s
+}
+
+/// 从模型还原输入参数值（支持任意位宽）。
 fn extract_inputs(
     compiled: &Compiled,
     enc: &crate::cnf::Encoded,
@@ -458,17 +492,8 @@ fn extract_inputs(
     };
     let mut parts = Vec::new();
     for p in params {
-        let w = p.width.bits();
-        let mut v: u128 = 0;
-        for i in 0..w.min(128) {
-            if let Some(var) = enc.var_of_input_bit(&p.name, i) {
-                let val = model.get(var as usize).copied().unwrap_or(false);
-                if val {
-                    v |= 1u128 << i;
-                }
-            }
-        }
-        parts.push(format!("{}={:#x}", p.name, v));
+        let hex = render_bits(|i| enc.var_of_input_bit(&p.name, i), model, p.width.bits());
+        parts.push(format!("{}={}", p.name, hex));
     }
     parts.join(", ")
 }
@@ -768,16 +793,8 @@ pub fn prove_equiv_sat(
             let model = solver.model();
             let mut parts = Vec::new();
             for p in a_in {
-                let w = p.width.bits();
-                let mut v: u128 = 0;
-                for bit in 0..w.min(128) {
-                    if let Some(var) = ea.var_of_input_bit(&p.name, bit) {
-                        if model.get(var as usize).copied().unwrap_or(false) {
-                            v |= 1u128 << bit;
-                        }
-                    }
-                }
-                parts.push(format!("{}={:#x}", p.name, v));
+                let hex = render_bits(|i| ea.var_of_input_bit(&p.name, i), &model, p.width.bits());
+                parts.push(format!("{}={}", p.name, hex));
             }
             Ok((false, Some(format!("反例: 输入 {}", parts.join(", ")))))
         }

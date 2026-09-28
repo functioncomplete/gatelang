@@ -47,6 +47,16 @@ const MAX_NETLIST_GATES: usize = 100_000;
 /// 全部声明累计门数上限（防"多声明 × 大模板"的跨声明总量 OOM）。
 const MAX_TOTAL_GATES: usize = 500_000;
 
+/// 单个端口/latch 的位宽上限。
+///
+/// 网表本身是**逐位**的（`Bits<N>` = N 个信号），因此对宽度没有结构性限制；
+/// 这个上限只用于阻止 `Bits<100000>` 这类把网表撑爆的声明。
+/// 设为 256 以支持真实 `uint256`。
+///
+/// **注意**：`sim.rs` / `verify.rs` / `equiv.rs` 内部用 `u128` 表示端口值，
+/// 因此位宽 > 128 的电路**不能**被模拟或穷举（形式化证明走 CNF，不受此限）。
+const MAX_WIDTH: u32 = 256;
+
 fn compiled_gates(c: &Compiled) -> usize {
     match c {
         Compiled::Combinational { netlist, .. } => netlist.gates.len(),
@@ -678,13 +688,13 @@ fn circuit_lower(c: &Circuit, compiler: &mut Compiler, depth: usize, stack: Vec<
     let mut env = Env::new();
     // 原型以 u128 表示信号：输入/输出位宽一律 ≤128，否则仿真/验证会静默截断（假通过）。
     for p in &c.params {
-        if p.width.bits() > 128 {
-            return Err(LowerError::new(c.span, "输入位宽 > 128 不支持（原型上限）"));
+        if p.width.bits() > MAX_WIDTH {
+            return Err(LowerError::new(c.span, &format!("输入位宽 > {MAX_WIDTH} 不支持")));
         }
     }
     for p in &c.returns {
-        if p.width.bits() > 128 {
-            return Err(LowerError::new(c.span, "输出位宽 > 128 不支持（原型上限）"));
+        if p.width.bits() > MAX_WIDTH {
+            return Err(LowerError::new(c.span, &format!("输出位宽 > {MAX_WIDTH} 不支持")));
         }
     }
     // 重复输出名会使 nl.outputs 覆盖 → 验证/等价读到同一信号，拒绝。
@@ -779,18 +789,18 @@ fn state_lower(s: &State, compiler: &mut Compiler) -> LowerResult<Compiled> {
         let mut env = Env::new();
         // 位宽 ≤128（同组合电路）
         for l in &s.latches {
-            if l.width.bits() > 128 {
-                return Err(LowerError::new(s.span, "latch 位宽 > 128 不支持"));
+            if l.width.bits() > MAX_WIDTH {
+                return Err(LowerError::new(s.span, &format!("latch 位宽 > {MAX_WIDTH} 不支持")));
             }
         }
         for p in &f.params {
-            if p.width.bits() > 128 {
-                return Err(LowerError::new(f.span, "参数位宽 > 128 不支持"));
+            if p.width.bits() > MAX_WIDTH {
+                return Err(LowerError::new(f.span, &format!("参数位宽 > {MAX_WIDTH} 不支持")));
             }
         }
         for p in &f.returns {
-            if p.width.bits() > 128 {
-                return Err(LowerError::new(f.span, "输出位宽 > 128 不支持"));
+            if p.width.bits() > MAX_WIDTH {
+                return Err(LowerError::new(f.span, &format!("输出位宽 > {MAX_WIDTH} 不支持")));
             }
         }
         for (i, p) in f.params.iter().enumerate() {

@@ -1,6 +1,6 @@
 # GateLang — NAND/LATCH 门级可验证计算语言
 
-[![tests](https://img.shields.io/badge/tests-71%20passing-brightgreen)](tests/integration.rs)
+[![tests](https://img.shields.io/badge/tests-73%20passing-brightgreen)](tests/integration.rs)
 [![rust](https://img.shields.io/badge/rust-1.96-orange)](https://www.rust-lang.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-blue)](#构建与测试)
 [![formal](https://img.shields.io/badge/verification-SAT%20%2F%20UNSAT-purple)](#形式化验证sat-后端)
@@ -18,7 +18,8 @@ M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文
 
 ```bash
 cargo build
-cargo test          # 71 个测试（35 单元 + 14 集成 + 19 形式化证明 + 3 ERC-20）
+cargo test          # 73 个测试（35 单元 + 14 集成 + 19 形式化证明 + 5 ERC-20）
+                    # ERC-20 的 uint256 慢证明用: cargo test --release -- --ignored
 ```
 
 ## 形式化验证（SAT 后端）
@@ -93,12 +94,16 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 | `examples/domain_equiv.gat` | 约束域等价 | 全域不等价、约束域 `a==1&&b==1` 等价并给反例 |
 | `examples/stdlib_l1.gat` | 模板库：全加器 / Mux2 / Comparator4 | 15 / 8 / 58 门，`Gates<>` 上界强制 + spec 穷举（含 gt） |
 | `examples/srlatch.gat` | SR Latch + 计数器 | 时序状态与 latch 更新 |
-| `examples/erc20_core.gat` | **ERC-20 纯计算核心** | checked add/sub + 余额守恒的形式化证明；含刻意漏洞版本，反例精确命中下溢/溢出 |
+| `examples/erc20_core.gat` | **ERC-20 纯计算核心（Bits<16>）** | checked add/sub + 余额守恒的形式化证明；含刻意漏洞版本，反例精确命中下溢/溢出 |
+| `examples/erc20_uint256.gat` | **ERC-20 算术核心（真实 uint256）** | checked add/sub 的独立判据等价性；余额守恒；含漏洞版本被驳倒 |
+| `examples/erc20_invariant.gat` | **全局不变量 Σbalances==totalSupply（uint256）** | 有界地址域（N=2）下的归纳步；含慢证明（约 9 分钟） |
+| `examples/erc20_invariant_small.gat` | 同上，N=4 @ Bits<8> | 说明账户数本身不是障碍 |
 
 ## 语言要点（原型子集）
 
 - **声明**：`circuit`（组合）/ `state`（时序）/ `spec`（规范）
-- **类型**：`Bit` / `Bits<N>`，资源注解 `gates: Gates<N> depth: Depth<N> cycles: Cycles<N>`
+- **类型**：`Bit` / `Bits<N>`（N ≤ 256，支持真实 `uint256`），资源注解 `gates: Gates<N> depth: Depth<N> cycles: Cycles<N>`
+  - 注意：`sim.rs` / `verify.rs` / `equiv.rs` 内部用 `u128` 表示端口值，位宽 > 128 的电路**不能被模拟或穷举**，只能用 `--prove` 做形式化验证
 - **原语**：`NAND` 展开 —— NOT=1、AND=2、OR=3、XOR=4 门
 - **表达式**：字面量、变量、位索引 `x[i]`、切片 `x[a..b]`、拼接 `[a,b]`、门调用、算术 `+ -`、按位 `& | ^`、比较 `== != < > <= >=`、三元 `c if x else y`
   - 比较运算符**同级左结合**：`a > b == c` 解析为 `((a > b) == c)`，需要 `(a > b) == c` 时请显式加括号

@@ -15,6 +15,8 @@
 
 use crate::cnf::{Cnf, Lit};
 
+use std::collections::BinaryHeap;
+
 /// 求解结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolveResult {
@@ -51,9 +53,13 @@ pub struct Solver {
     reason: Vec<i32>,
     /// 变量 → 相位保存（上次赋值）
     phase: Vec<i8>,
-    /// 变量 → VSIDS 活动度
-    activity: Vec<f64>,
-    activity_inc: f64,
+    /// 变量 → VSIDS 活动度（定点 u64，便于放入二叉堆；f64 无 Ord）
+    activity: Vec<u64>,
+    activity_inc: u64,
+    /// 决策候选最大堆：(活动度, 变量)。允许陈旧重复条目，出堆时校验。
+    heap: BinaryHeap<(u64, u32)>,
+    /// 变量是否已在堆中（避免重复插入导致堆无限膨胀）
+    in_heap: Vec<bool>,
     /// 双监视：literals 索引 → 子句下标
     watches: Vec<Vec<i32>>,
     trail: Vec<Lit>,
@@ -90,8 +96,10 @@ impl Solver {
             level: vec![0; (n + 1) as usize],
             reason: vec![-1; (n + 1) as usize],
             phase: vec![-1; (n + 1) as usize],
-            activity: vec![0.0; (n + 1) as usize],
-            activity_inc: 1.0,
+            activity: vec![0; (n + 1) as usize],
+            activity_inc: 1,
+            heap: BinaryHeap::new(),
+            in_heap: vec![false; (n + 1) as usize],
             watches: vec![Vec::new(); ((n as usize) + 1) * 2],
             trail: Vec::new(),
             trail_lim: Vec::new(),
@@ -99,13 +107,17 @@ impl Solver {
             seen: vec![false; (n + 1) as usize],
             init_conflict: false,
             max_conflicts: 2_000_000,
-            max_learnts: 200_000,
+            max_learnts: 60_000,
             reduce_threshold: 5_000,
             stats: SatStats::default(),
         };
+        // 预填充决策堆：所有变量初始活动度 0，必须显式入堆，
+        // 否则 pick_branch 会退化为 O(n) 线性扫描（大实例上极慢）。
+        for v in 1..=n as usize {
+            s.insert_var(v);
+        }
         // 载入子句
-        for c in &cnf.clauses {
-            if c.is_empty() {
+        for c in &cnf.clauses {            if c.is_empty() {
                 s.clauses.push(Clause { lits: Vec::new(), learnt: false });
                 continue;
             }
@@ -192,46 +204,51 @@ impl Solver {
             while i < ws.len() {
                 let ci = ws[i];
                 i += 1;
-                let mut lits = match self.clauses.get(ci as usize) {
-                    Some(c) => c.lits.clone(),
+                let ciu = ci as usize;
+                let len = match self.clauses.get(ciu) {
+                    Some(c) => c.lits.len(),
                     None => continue,
                 };
-                // 规范：lits[1] == fl
-                if lits[0] == fl {
-                    lits.swap(0, 1);
+                // 只取两个监视文字（**不克隆整条子句** —— 这是传播热路径）
+                let mut first = self.clauses[ciu].lits[0];
+                let mut second = self.clauses[ciu].lits[1];
+                if first == fl {
+                    std::mem::swap(&mut first, &mut second);
                 }
-                if lits[1] != fl {
+                if second != fl {
                     // 监视表与实际不符 → 保守保留，不静默丢弃
                     ws[out] = ci;
                     out += 1;
-                    self.clauses[ci as usize].lits = lits;
                     continue;
                 }
-                let first = lits[0];
                 self.stats.propagations += 1;
                 if self.value_lit(first) == Some(true) {
+                    // 规范化：确保 lits[1] == fl
+                    self.clauses[ciu].lits[0] = first;
+                    self.clauses[ciu].lits[1] = second;
                     ws[out] = ci;
                     out += 1;
-                    self.clauses[ci as usize].lits = lits;
                     continue;
                 }
-                // 寻找替代监视
-                let mut moved = false;
-                for k in 2..lits.len() {
-                    let lk = lits[k];
+                // 寻找替代监视（只读扫描）
+                let mut repl: Option<(usize, Lit)> = None;
+                for k in 2..len {
+                    let lk = self.clauses[ciu].lits[k];
                     if self.value_lit(lk) != Some(false) {
-                        lits[1] = lk;
-                        lits[k] = fl;
-                        self.watches[lit_idx(lk)].push(ci);
-                        moved = true;
+                        repl = Some((k, lk));
                         break;
                     }
                 }
-                self.clauses[ci as usize].lits = lits;
-                if moved {
+                if let Some((k, lk)) = repl {
+                    self.clauses[ciu].lits[0] = first;
+                    self.clauses[ciu].lits[1] = lk;
+                    self.clauses[ciu].lits[k] = second; // second == fl
+                    self.watches[lit_idx(lk)].push(ci);
                     continue; // 不再保留在 wi
                 }
                 // 无替代：成为单位或冲突
+                self.clauses[ciu].lits[0] = first;
+                self.clauses[ciu].lits[1] = second;
                 ws[out] = ci;
                 out += 1;
                 match self.value_lit(first) {
@@ -263,12 +280,26 @@ impl Solver {
 
     fn var_bump(&mut self, v: usize) {
         self.activity[v] += self.activity_inc;
-        if self.activity[v] > 1e100 {
+        if self.activity[v] > (1u64 << 60) {
+            // 定点溢出保护：整体右移，保持相对次序
             for a in self.activity.iter_mut() {
-                *a *= 1e-100;
+                *a >>= 1;
             }
-            self.activity_inc *= 1e-100;
+            self.activity_inc = (self.activity_inc >> 1).max(1);
         }
+    }
+
+    /// 把变量插入决策堆（若不在堆中）。
+    fn insert_var(&mut self, v: usize) {
+        if self.assign[v] == 0 && !self.in_heap[v] {
+            self.heap.push((self.activity[v], v as u32));
+            self.in_heap[v] = true;
+        }
+    }
+
+    /// VSIDS 衰减：增量增长等价于活动度相对衰减。
+    fn decay(&mut self) {
+        self.activity_inc += self.activity_inc / 20 + 1;
     }
 
     /// 1-UIP 冲突分析。返回（学习子句, 回跳层）。
@@ -358,33 +389,45 @@ impl Solver {
             return;
         }
         let lim = self.trail_lim[level as usize];
+        let mut freed: Vec<usize> = Vec::new();
         for i in (lim..self.trail.len()).rev() {
             let l = self.trail[i];
             let v = l.abs() as usize;
             self.phase[v] = if l > 0 { 1 } else { -1 };
             self.assign[v] = 0;
             self.reason[v] = -1;
+            freed.push(v);
         }
         self.trail.truncate(lim);
         self.trail_lim.truncate(level as usize);
         self.qhead = self.trail.len();
+        // 重新变为未赋值的变量必须回到决策堆，否则会被漏掉
+        for v in freed {
+            self.insert_var(v);
+        }
     }
 
-    fn pick_branch(&self) -> Option<Lit> {
-        let mut best: i32 = -1;
-        let mut best_act = f64::NEG_INFINITY;
+    fn pick_branch(&mut self) -> Option<Lit> {
+        while let Some((act, v)) = self.heap.pop() {
+            let v = v as usize;
+            self.in_heap[v] = false;
+            if self.assign[v] != 0 {
+                continue; // 已赋值，丢弃（取消赋值时会重新插入）
+            }
+            if act != self.activity[v] {
+                // 陈旧条目：用当前活动度重新入堆再比较
+                self.insert_var(v);
+                continue;
+            }
+            return Some(if self.phase[v] > 0 { v as i32 } else { -(v as i32) });
+        }
+        // 兜底：堆空但仍存在未赋值变量（正常流程不应到达）
         for v in 1..=self.nvars as usize {
-            if self.assign[v] == 0 && self.activity[v] > best_act {
-                best_act = self.activity[v];
-                best = v as i32;
+            if self.assign[v] == 0 {
+                return Some(if self.phase[v] > 0 { v as i32 } else { -(v as i32) });
             }
         }
-        if best < 0 {
-            return None;
-        }
-        let v = best as usize;
-        let positive = self.phase[v] > 0;
-        Some(if positive { best } else { -best })
+        None
     }
 
     fn add_learnt(&mut self, lits: Vec<Lit>) -> i32 {
@@ -426,12 +469,13 @@ impl Solver {
             learnt_idx.iter().take(learnt_idx.len() / 2).copied().collect();
         let mut new_clauses: Vec<Clause> = Vec::with_capacity(self.clauses.len());
         let mut remap: Vec<i32> = vec![-1; self.clauses.len()];
-        for (i, c) in self.clauses.iter().enumerate() {
+        // 移动而非克隆（`mem::take` + into_iter），避免缩减时的大规模分配
+        for (i, c) in std::mem::take(&mut self.clauses).into_iter().enumerate() {
             if to_remove.contains(&i) {
                 continue;
             }
             remap[i] = new_clauses.len() as i32;
-            new_clauses.push(c.clone());
+            new_clauses.push(c);
         }
         self.clauses = new_clauses;
         // 重建监视表与 reason（索引变了）
@@ -487,9 +531,11 @@ impl Solver {
                     let l0 = self.clauses[ci as usize].lits[0];
                     self.enqueue(l0, Some(ci));
                 }
+                self.decay();
                 if self.stats.conflicts >= restart_budget {
                     self.stats.restarts += 1;
                     self.cancel_until(0);
+                    // 几何增长的重启预算（实测：加上限反而变慢，故不设上限）
                     restart_budget = restart_budget + restart_budget / 2 + 1;
                     if self.clauses.len() > self.max_learnts {
                         self.reduce_db();

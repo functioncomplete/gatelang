@@ -191,3 +191,62 @@ fn eval(comp: &gatelang::lower::Compiled, env: &HashMap<String, u128>) -> HashMa
     }
     out
 }
+
+/* ==================== 有界地址域的全局不变量 ==================== */
+
+fn invariant_src() -> String {
+    std::fs::read_to_string("examples/erc20_invariant.gat").expect("读取 erc20_invariant.gat")
+}
+
+fn invariant_small_src() -> String {
+    std::fs::read_to_string("examples/erc20_invariant_small.gat")
+        .expect("读取 erc20_invariant_small.gat")
+}
+
+/// N=4 账户 @ Bits<8> 的不变量保持 —— 证明"账户数本身不是障碍"。
+#[test]
+fn invariant_preservation_four_accounts_small_width() {
+    let (decls, compiled) = compile(&invariant_small_src());
+    let reports = prove_all(&decls, &compiled);
+    let r = report_for(&reports, "ERC20Step4Small");
+    assert!(
+        matches!(verdict_of(r, "postcondition"), Verdict::Proven),
+        "4 账户 @ Bits<8> 的不变量保持应被证明: {:?}",
+        verdict_of(r, "postcondition")
+    );
+}
+
+/// 穷举验证器对 256 位不变量**完全无能为力**（768 位输入）。
+#[test]
+fn invariant_uint256_is_beyond_exhaustive_verification() {
+    let (decls, compiled) = compile(&invariant_src());
+    let brute = verify_all(&decls, &compiled);
+    assert!(!brute.ok(), "穷举应拒绝 256 位规格");
+}
+
+/// 真实 uint256 位宽下的不变量保持与算术内核引理。
+///
+/// **慢**（约 9 分钟、累计 200 万次冲突）：默认跳过，用
+/// `cargo test --release -- --ignored` 运行。
+#[test]
+#[ignore = "慢：真实 uint256 位宽的形式化证明约需 9 分钟"]
+fn invariant_preservation_uint256_slow() {
+    let (decls, compiled) = compile(&invariant_src());
+    let reports = prove_all(&decls, &compiled);
+
+    // 核心引理：同额加减相消
+    let r = report_for(&reports, "AmountCancels256");
+    assert!(
+        matches!(verdict_of(r, "postcondition"), Verdict::Proven),
+        "AmountCancels256 应被证明: {:?}",
+        verdict_of(r, "postcondition")
+    );
+
+    // N=2 账户 @ uint256 的不变量保持（归纳步）
+    let r = report_for(&reports, "ERC20Step2");
+    assert!(
+        matches!(verdict_of(r, "postcondition"), Verdict::Proven),
+        "ERC20Step2 的归纳步应被证明: {:?}",
+        verdict_of(r, "postcondition")
+    );
+}
