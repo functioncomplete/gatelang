@@ -562,6 +562,27 @@ fn discharge(
     })
 }
 
+/// 把规格表达式综合为门级电路（工具与测试用）。
+///
+/// 返回网表副本；表达式真值以一个 1 位信号给出，并登记为输出 `__spec__`，
+/// 便于用 `sim::eval_netlist` 直接求值 —— 这是**综合语义保真**的可验证接口。
+pub fn synthesize_expr(compiled: &Compiled, expr: &SpecExpr) -> Result<(Netlist, Sig), String> {
+    let base_nl = match compiled {
+        Compiled::Combinational { netlist, .. } => netlist,
+        Compiled::State { .. } => return Err("仅支持组合电路".into()),
+    };
+    let mut nl = base_nl.clone();
+    let env = port_env(base_nl, compiled)?;
+    let mut synth = Synth::new(&mut nl, env);
+    let bv = synth.encode(expr)?;
+    let sig = synth.to_bool(&bv);
+    if synth.over_budget() {
+        return Err("规格综合超出预算".into());
+    }
+    nl.outputs.insert("__spec__".to_string(), sig);
+    Ok((nl, sig))
+}
+
 /// 对单个 spec 执行形式化证明。
 pub fn prove_spec(compiled: &Compiled, spec: &Spec) -> Result<ProveReport, String> {
     let mut rep = ProveReport { circuit: spec.name.clone(), obligations: Vec::new(), pre_unsatisfiable: false };

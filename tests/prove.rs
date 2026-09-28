@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use gatelang::equiv::check_equiv_domain;
 use gatelang::lower::Compiler;
 use gatelang::parser::parse_program;
-use gatelang::prove::{prove_all, prove_equiv_sat, Verdict};
+use gatelang::prove::{prove_all, prove_equiv_sat, synthesize_expr, Verdict};
 use gatelang::sim;
-use gatelang::spec::{assert_spec, parse_spec};
+use gatelang::spec::{assert_spec, eval_spec, parse_spec};
 use gatelang::verify::verify_all;
 
 fn compile(src: &str) -> (Vec<gatelang::ast::Decl>, Vec<gatelang::lower::Compiled>) {
@@ -489,4 +489,256 @@ fn synthesis_matches_brute_force_on_expression_semantics() {
             rep.obligations.iter().map(|o| &o.verdict).collect::<Vec<_>>()
         );
     }
+}
+
+/* ==================== 决定性测试：综合语义保真 ==================== */
+
+/// **综合保真（决定性）**：把每个规格表达式综合成门级电路，
+/// 穷举全部 4 位输入，把「门级模拟结果」与「`spec::eval_spec` 的 u128 参考求值」
+/// 逐位比对。任何综合语义偏差都会在这里暴露。
+///
+/// 这个测试如果能早点存在，`lt` 的进位 bug（`lt(3,2)` 误判为真）会立刻被抓到。
+#[test]
+fn synthesised_circuit_matches_eval_spec_exhaustively() {
+    let exprs = [
+        "a + b",
+        "a - b",
+        "(a + b) % 2",
+        "(a + b) % 4",
+        "(a + b) % (2^4)",
+        "(a + a + a) % 16",
+        "(a * 3) % 16",
+        "(a * b) % 16",
+        "a > b",
+        "a >= b",
+        "a < b",
+        "a <= b",
+        "a == b",
+        "a != b",
+        "!(a == b)",
+        "(a - b) == 0",
+        "a <= b && b <= a",
+        "a > 0 || b > 0",
+        "1 && 2",
+        "0 || 3",
+        "MAX_UINT - a",
+        "(2^4 - 1) - a",
+        "a + b - a",
+        "((a + b) >= 2^4) * (2^4)",
+        "a > b || a == b",
+    ];
+    let src = "circuit C(a: Bits<4>, b: Bits<4>) -> (y: Bit) { y = a == a; return y; }";
+    let (_, compiled) = compile(src);
+    let c = find(&compiled, "C");
+
+    for e in exprs {
+        let parsed = parse_spec(e).unwrap_or_else(|err| panic!("`{e}` 解析失败: {err}"));
+        let (nl, _sig) = synthesize_expr(c, &parsed)
+            .unwrap_or_else(|err| panic!("`{e}` 综合失败（应可支持）: {err}"));
+        for a in 0u128..16 {
+            for b in 0u128..16 {
+                let mut env: HashMap<String, u128> = HashMap::new();
+                env.insert("a".to_string(), a);
+                env.insert("b".to_string(), b);
+                // 门级综合电路的求值
+                let res = sim::eval_netlist(&nl, &env);
+                let synth_val = res.get("__spec__").copied().unwrap_or(false);
+                // 参考求值器（经 18 轮审计的 u128 语义）
+                let ref_val = eval_spec(&parsed, &env).expect("参考求值") != 0;
+                assert_eq!(
+                    synth_val, ref_val,
+                    "表达式 `{e}` 在 a={a} b={b} 时：综合电路给出 {synth_val}，参考求值器给出 {ref_val}"
+                );
+            }
+        }
+    }
+}
+
+/// 综合保真（宽度交叉）：不同端口位宽组合下也必须一致。
+#[test]
+fn synthesis_fidelity_across_port_widths() {
+    let src = r#"
+    circuit W(a: Bit, b: Bits<3>, c: Bits<8>) -> (y: Bit) { y = a == a; return y; }
+    "#;
+    let (_, compiled) = compile(src);
+    let c = find(&compiled, "W");
+    let exprs = [
+        "a + b",
+        "b + c",
+        "c - b",
+        "(a + c) % 8",
+        "a * b",
+        "b * c",
+        "c > b",
+        "(a + b + c) % 2",
+        "a && b",
+        "!(a) || c",
+    ];
+    for e in exprs {
+        let parsed = parse_spec(e).unwrap_or_else(|err| panic!("`{e}` 解析失败: {err}"));
+        let (nl, _) = synthesize_expr(c, &parsed)
+            .unwrap_or_else(|err| panic!("`{e}` 综合失败（应可支持）: {err}"));
+        for a in 0u128..2 {
+            for b in 0u128..8 {
+                for cc in [0u128, 1, 7, 8, 127, 128, 255] {
+                    let mut env: HashMap<String, u128> = HashMap::new();
+                    env.insert("a".to_string(), a);
+                    env.insert("b".to_string(), b);
+                    env.insert("c".to_string(), cc);
+                    let res = sim::eval_netlist(&nl, &env);
+                    let synth_val = res.get("__spec__").copied().unwrap_or(false);
+                    let ref_val = eval_spec(&parsed, &env).expect("参考求值") != 0;
+                    assert_eq!(
+                        synth_val, ref_val,
+                        "表达式 `{e}` 在 a={a} b={b} c={cc} 时不一致：综合 {synth_val} vs 参考 {ref_val}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/* ==================== 假证明猎杀：随机规格模糊测试 ==================== */
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self, m: u64) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 % m
+    }
+}
+
+/// 随机生成一个**全括号化**的规格表达式（广度受限于 depth，保证可综合）。
+fn gen_expr(r: &mut Rng, depth: usize, vars: &[&str]) -> String {
+    let ops = ["+", "-", "%", "*", ">", ">=", "<", "<=", "==", "!=", "&&", "||"];
+    let consts = ["0", "1", "2", "3", "15", "16", "MAX_UINT", "true", "false"];
+    if depth == 0 || r.next(3) == 0 {
+        if r.next(3) == 0 {
+            let c = consts[r.next(consts.len() as u64) as usize];
+            return c.to_string();
+        }
+        let v = vars[r.next(vars.len() as u64) as usize];
+        return v.to_string();
+    }
+    let op = ops[r.next(ops.len() as u64) as usize];
+    let a = gen_expr(r, depth - 1, vars);
+    let b = gen_expr(r, depth - 1, vars);
+    format!("({a} {op} {b})")
+}
+
+fn is_fail_closed(err: &str) -> bool {
+    err.contains("超出预算")
+        || err.contains("fail-closed")
+        || err.contains("除法器")
+        || err.contains("代价过高")
+}
+
+/// **随机规格模糊测试**：在多个电路上随机生成 postcondition（绝大多数是错的），
+/// 逐条比对形式化证明器与穷举验证器的结论。
+///
+/// 任何一次"证明器说已证明、穷举却找到反例"（或反向）都说明有 bug。
+/// 这是对假证明/假反例最直接的猎杀。
+#[test]
+fn fuzz_prover_agrees_with_verifier() {
+    let circuits = [
+        "circuit C(a: Bits<4>, b: Bits<4>) -> (y: Bits<4>) { y = a + b; return y; }",
+        "circuit C(a: Bits<4>, b: Bits<4>) -> (y: Bits<4>) { y = a & b; return y; }",
+        "circuit C(a: Bits<4>, b: Bits<4>) -> (y: Bits<4>) { y = a + a; return y; }",
+        "circuit C(a: Bits<4>, b: Bits<4>) -> (y: Bits<4>) { y = a | b; return y; }",
+        "circuit C(a: Bits<4>, b: Bits<4>) -> (y: Bit) { y = a == b; return y; }",
+        "circuit C(a: Bits<4>, b: Bits<4>) -> (y: Bit) { y = a > b; return y; }",
+        "circuit C(a: Bits<4>, b: Bits<4>) -> (y: Bits<4>) { y = b; return y; }",
+    ];
+    let mut r = Rng(0xC0FFEE1234567);
+    let mut compared = 0usize;
+    let mut fail_closed = 0usize;
+    for i in 0..400 {
+        let circ = circuits[i % circuits.len()];
+        let post = gen_expr(&mut r, 3, &["a", "b", "y"]);
+        let src = [
+            circ,
+            "\nspec C { precondition: true; postcondition: ",
+            &post,
+            "; invariant: true; }",
+        ]
+        .concat();
+        let (decls, compiled) = match std::panic::catch_unwind(|| compile(&src)) {
+            Ok(x) => x,
+            Err(_) => continue, // 生成器偶发产生非法源码，跳过
+        };
+        let brute = verify_all(&decls, &compiled);
+        let sat = prove_all(&decls, &compiled);
+        match sat[0].as_ref() {
+            Ok(rep) => {
+                compared += 1;
+                assert_eq!(
+                    brute.ok(),
+                    rep.all_proven(),
+                    "post `{post}`（电路 #{}) 结论不一致：穷举={} 失败项{:?}；SAT={} {:?}",
+                    i % circuits.len(),
+                    brute.ok(),
+                    brute.failed,
+                    rep.all_proven(),
+                    rep.obligations.iter().map(|o| (&o.kind, &o.verdict)).collect::<Vec<_>>()
+                );
+            }
+            Err(e) => {
+                // 不支持的表达式必须 fail-closed，绝不能给出结论
+                assert!(
+                    is_fail_closed(e),
+                    "post `{post}` 的失败必须是明确的 fail-closed，实际: {e}"
+                );
+                fail_closed += 1;
+            }
+        }
+    }
+    assert!(compared >= 200, "可比对用例太少（{compared}），模糊测试覆盖不足");
+    // 记录但不强制：fail-closed 比例反映综合器的能力边界
+    println!("模糊测试：比对 {compared} 例，fail-closed {fail_closed} 例");
+}
+
+/// **等价性模糊测试**：随机电路对，比对 SAT/miter 与穷举的等价性结论。
+#[test]
+fn fuzz_equivalence_agrees_with_brute_force() {
+    let bodies = [
+        "y = a + b; return y;",
+        "y = a & b; return y;",
+        "y = a | b; return y;",
+        "y = a + a; return y;",
+        "y = a + a + b; return y;",
+        "y = b; return y;",
+        "y = a; return y;",
+    ];
+    let mut r = Rng(0xBADC0DE999);
+    let mut eqs = 0usize;
+    let mut neqs = 0usize;
+    for i in 0..120 {
+        let b1 = bodies[i % bodies.len()];
+        let b2 = bodies[r.next(bodies.len() as u64) as usize];
+        let src = [
+            "circuit P(a: Bits<4>, b: Bits<4>) -> (y: Bits<4>) { ",
+            b1,
+            " }\ncircuit Q(a: Bits<4>, b: Bits<4>) -> (y: Bits<4>) { ",
+            b2,
+            " }",
+        ]
+        .concat();
+        let (_, compiled) = compile(&src);
+        let p = find(&compiled, "P");
+        let q = find(&compiled, "Q");
+        let (brute_eq, _) = check_equiv_domain(p, q, None).expect("穷举");
+        let (sat_eq, cex) = prove_equiv_sat(p, q).expect("SAT");
+        assert_eq!(
+            brute_eq, sat_eq,
+            "等价性结论不一致：P=`{b1}` Q=`{b2}`；穷举={brute_eq} SAT={sat_eq} 反例{cex:?}"
+        );
+        if sat_eq { eqs += 1 } else { neqs += 1 }
+        // 不等价时必须给出反例
+        if !sat_eq {
+            assert!(cex.is_some(), "不等价必须给出反例");
+        }
+    }
+    assert!(eqs > 0 && neqs > 0, "模糊测试应同时覆盖等价与不等价（eq={eqs} neq={neqs}）");
 }

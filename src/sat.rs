@@ -67,6 +67,8 @@ pub struct Solver {
     /// 资源上限
     pub max_conflicts: u64,
     pub max_learnts: usize,
+    /// 触发学习子句库缩减的最少可删子句数（测试中调 0 可强制走缩减路径）。
+    pub reduce_threshold: usize,
     pub stats: SatStats,
 }
 
@@ -98,6 +100,7 @@ impl Solver {
             init_conflict: false,
             max_conflicts: 2_000_000,
             max_learnts: 200_000,
+            reduce_threshold: 5_000,
             stats: SatStats::default(),
         };
         // 载入子句
@@ -269,7 +272,10 @@ impl Solver {
     }
 
     /// 1-UIP 冲突分析。返回（学习子句, 回跳层）。
-    fn analyze(&mut self, mut confl: usize) -> (Vec<Lit>, u32) {
+    ///
+    /// 返回 `None` 表示推理图无法收敛（内部不变量被破坏）——
+    /// 调用方必须 **fail-closed**（返回 `Unknown`），绝不能猜一个结论。
+    fn analyze(&mut self, mut confl: usize) -> Option<(Vec<Lit>, u32)> {
         let mut learnt: Vec<Lit> = vec![0]; // 占位：asserting literal
         let mut path_c: i32 = 0;
         let mut p: Lit = 0;
@@ -308,8 +314,8 @@ impl Solver {
                 }
             }
             if !found {
-                // 不应发生：说明推理图不完整。保守返回单文字断言（若 p 仍为 0 则为恒假）
-                break;
+                // 推理图不完整：不能猜结论，交给调用方 fail-closed。
+                return None;
             }
             let v = p.abs() as usize;
             self.seen[v] = false;
@@ -320,10 +326,14 @@ impl Solver {
                 break;
             }
             if r < 0 {
-                // 决策变量出现而 path_c 仍 > 0：推理图异常，保守收束
-                break;
+                // 决策变量出现而 path_c 仍 > 0：推理图异常，fail-closed
+                return None;
             }
             confl = r as usize;
+        }
+        if p == 0 {
+            // 未能定位断言文字：绝不允许写出 `-0` 这样的非法文字
+            return None;
         }
         learnt[0] = -p;
         // 次级最高层放到 [1]
@@ -340,7 +350,7 @@ impl Solver {
         for l in learnt.iter() {
             self.seen[l.abs() as usize] = false;
         }
-        (learnt, bt)
+        Some((learnt, bt))
     }
 
     fn cancel_until(&mut self, level: u32) {
@@ -388,13 +398,26 @@ impl Solver {
         ci
     }
 
-    /// 学习子句库缩减：保留二元子句与活动度最高的部分。
+    /// 学习子句库缩减：保留二元子句、**当前作为蕴含原因的子句**，以及后加入的一半。
+    ///
+    /// 删除仍是 `reason` 的子句会破坏后续冲突分析 —— 可能推出错误的 UNSAT（假证明）。
+    /// 因此这些子句**必须**保留。
     fn reduce_db(&mut self) {
-        // 不删除二元子句（对传播价值高）；删除一半三元以上学习子句。
+        let mut keep_reason: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for v in 1..=self.nvars as usize {
+            let r = self.reason[v];
+            if r >= 0 {
+                keep_reason.insert(r as usize);
+            }
+        }
         let mut learnt_idx: Vec<usize> = (0..self.clauses.len())
-            .filter(|&i| self.clauses[i].learnt && self.clauses[i].lits.len() > 2)
+            .filter(|&i| {
+                self.clauses[i].learnt
+                    && self.clauses[i].lits.len() > 2
+                    && !keep_reason.contains(&i)
+            })
             .collect();
-        if learnt_idx.len() < 5_000 {
+        if learnt_idx.len() < self.reduce_threshold {
             return;
         }
         // 简单策略：删一半（按下标，保留后加入的）
@@ -451,7 +474,11 @@ impl Solver {
                 if self.decision_level() == 0 {
                     return SolveResult::Unsat;
                 }
-                let (learnt, bt) = self.analyze(confl);
+                let (learnt, bt) = match self.analyze(confl) {
+                    Some(x) => x,
+                    // 冲突分析无法收敛 → fail-closed，绝不冒充 UNSAT/SAT
+                    None => return SolveResult::Unknown,
+                };
                 self.cancel_until(bt);
                 if learnt.len() == 1 {
                     self.enqueue(learnt[0], None);
@@ -702,5 +729,149 @@ mod tests {
         for v in 1..=n {
             assert!(m[v as usize], "链式蕴含应强制变量 {v} 为真");
         }
+    }
+
+    /// 强制走学习子句库缩减路径（`reduce_threshold = 0`），
+    /// 结论必须与穷举一致 —— 缩减后 `reason` 重映射若出错会直接产生假 UNSAT。
+    #[test]
+    fn differential_with_db_reduction_enabled() {
+        let mut state: u64 = 0xDEADBEEFCAFEBABE;
+        let mut next = |m: u64| -> u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        for trial in 0..120 {
+            let nv = 4 + (next(7) as i32);
+            let nc = (nv as u64 * 6) + next(10);
+            let mut c = Cnf::new();
+            for _ in 0..nv {
+                c.new_var();
+            }
+            for _ in 0..nc {
+                let k = 2 + next(3);
+                let mut cl = Vec::new();
+                for _ in 0..k {
+                    let v = 1 + next(nv as u64) as i32;
+                    let l = if next(2) == 1 { -v } else { v };
+                    if !cl.contains(&l) {
+                        cl.push(l);
+                    }
+                }
+                c.add_clause(cl);
+            }
+            let mut s = Solver::new(&c);
+            s.reduce_threshold = 0; // 每次重启都触发缩减
+            let got = s.solve();
+            let expect = brute_force_sat(&c);
+            assert_ne!(got, SolveResult::Unknown, "trial {trial} 不应 Unknown");
+            assert_eq!(got == SolveResult::Sat, expect, "trial {trial}: 缩减路径下结论不一致");
+        }
+    }
+
+    /// 鸽巢原理在强制缩减下仍必须报 UNSAT。
+    #[test]
+    fn pigeonhole_unsat_with_db_reduction() {
+        for n in 3..6usize {
+            let mut c = Cnf::new();
+            let var = |i: usize, j: usize| -> i32 { (i * n + j + 1) as i32 };
+            for _ in 0..((n + 1) * n) {
+                c.new_var();
+            }
+            for i in 0..=n {
+                c.add_clause((0..n).map(|j| var(i, j)).collect());
+            }
+            for j in 0..n {
+                for a in 0..=n {
+                    for b in (a + 1)..=n {
+                        c.add_clause(vec![-var(a, j), -var(b, j)]);
+                    }
+                }
+            }
+            let mut s = Solver::new(&c);
+            s.reduce_threshold = 0;
+            assert_eq!(s.solve(), SolveResult::Unsat, "PHP 缩减路径下应 UNSAT");
+        }
+    }
+
+    /// 大规模随机差分（3000 组）：覆盖单位子句、二元、长子句、重复文字、
+    /// 恒真子句、互补单位子句等形状，并与穷举参考求解器比对；
+    /// 同时强制打开学习子句库缩减路径。
+    #[test]
+    fn differential_large_scale_mixed_shapes() {
+        let mut state: u64 = 0x123456789ABCDEF;
+        let mut next = |m: u64| -> u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % m
+        };
+        for trial in 0..3000 {
+            let nv = 1 + (next(8) as i32); // 1..8
+            let nc = next(14);
+            let mut c = Cnf::new();
+            for _ in 0..nv {
+                c.new_var();
+            }
+            for _ in 0..nc {
+                let shape = next(5);
+                let mut cl: Vec<i32> = Vec::new();
+                let k = match shape {
+                    0 => 1,           // 单位
+                    1 => 2,           // 二元
+                    2 => 3,           // 三元
+                    3 => 1 + next(6), // 长子句
+                    _ => 0,           // 空子句（偶发 UNSAT）
+                };
+                for _ in 0..k {
+                    let v = 1 + next(nv as u64) as i32;
+                    let l = if next(2) == 1 { -v } else { v };
+                    if !cl.contains(&l) {
+                        cl.push(l);
+                    }
+                }
+                c.add_clause(cl);
+            }
+            let expect = brute_force_sat(&c);
+            let mut s = Solver::new(&c);
+            // 一半用例强制走缩减路径
+            if trial % 2 == 0 {
+                s.reduce_threshold = 0;
+            }
+            let got = s.solve();
+            assert_ne!(got, SolveResult::Unknown, "trial {trial} 不应 Unknown");
+            assert_eq!(got == SolveResult::Sat, expect, "trial {trial}: nv={nv} nc={nc} 结论不一致");
+            if got == SolveResult::Sat {
+                assert!(
+                    Solver::check_model(&s.model(), &c),
+                    "trial {trial}: 返回的模型不满足公式"
+                );
+            }
+        }
+    }
+
+    /// 互补单位子句 + 空子句混合的确定性边界用例。
+    #[test]
+    fn unit_conflicts_and_empty_clauses() {
+        // [1] [-1] → UNSAT
+        let mut c = Cnf::new();
+        c.new_var();
+        c.add_unit(1);
+        c.add_unit(-1);
+        assert_eq!(solve_cnf(&c), SolveResult::Unsat);
+        // [1] [1] [-1] → UNSAT（重复单位）
+        let mut c = Cnf::new();
+        c.new_var();
+        c.add_unit(1);
+        c.add_unit(1);
+        c.add_unit(-1);
+        assert_eq!(solve_cnf(&c), SolveResult::Unsat);
+        // 空子句与单位并存 → UNSAT
+        let mut c = Cnf::new();
+        c.new_var();
+        c.add_unit(1);
+        c.add_empty();
+        assert_eq!(solve_cnf(&c), SolveResult::Unsat);
     }
 }
