@@ -567,7 +567,7 @@ impl Parser {
     }
 
     fn parse_or(&mut self) -> PResult<Expr> {
-        let mut lhs = self.parse_and()?;
+        let mut lhs = self.parse_xor()?;
         let mut n = 0u32;
         while self.eat(&Tok::Pipe) {
             n += 1;
@@ -575,8 +575,24 @@ impl Parser {
                 return Err(format!("{:?}: 表达式运算项过多（>256）", self.span()));
             }
             let sp = self.span();
-            let rhs = self.parse_and()?;
+            let rhs = self.parse_xor()?;
             lhs = Expr::Bin(BinOp::Or, Box::new(lhs), Box::new(rhs), sp);
+        }
+        Ok(lhs)
+    }
+
+    /// 按位异或：优先级介于 `|` 与 `&` 之间（与 C 一致）。
+    fn parse_xor(&mut self) -> PResult<Expr> {
+        let mut lhs = self.parse_and()?;
+        let mut n = 0u32;
+        while self.eat(&Tok::Caret) {
+            n += 1;
+            if n > 256 {
+                return Err(format!("{:?}: 表达式运算项过多（>256）", self.span()));
+            }
+            let sp = self.span();
+            let rhs = self.parse_and()?;
+            lhs = Expr::Bin(BinOp::Xor, Box::new(lhs), Box::new(rhs), sp);
         }
         Ok(lhs)
     }
@@ -603,6 +619,10 @@ impl Parser {
             let (op, sp) = match self.peek().clone() {
                 Tok::EqEq => (BinOp::Eq, self.span()),
                 Tok::Ne => (BinOp::Ne, self.span()),
+                Tok::Lt => (BinOp::Lt, self.span()),
+                Tok::Gt => (BinOp::Gt, self.span()),
+                Tok::Le => (BinOp::Le, self.span()),
+                Tok::Ge => (BinOp::Ge, self.span()),
                 _ => break,
             };
             n += 1;
@@ -619,14 +639,21 @@ impl Parser {
     fn parse_add(&mut self) -> PResult<Expr> {
         let mut lhs = self.parse_unary()?;
         let mut n = 0u32;
-        while self.eat(&Tok::Plus) {
+        loop {
+            let sp = self.span();
+            let op = if self.eat(&Tok::Plus) {
+                BinOp::Add
+            } else if self.eat(&Tok::Minus) {
+                BinOp::Sub
+            } else {
+                break;
+            };
             n += 1;
             if n > 256 {
                 return Err(format!("{:?}: 表达式运算项过多（>256）", self.span()));
             }
-            let sp = self.span();
             let rhs = self.parse_unary()?;
-            lhs = Expr::Bin(BinOp::Add, Box::new(lhs), Box::new(rhs), sp);
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs), sp);
         }
         Ok(lhs)
     }

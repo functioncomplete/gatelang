@@ -385,6 +385,31 @@ fn lower_expr(
                     let (sums, _cout) = nl.adder(&va.sigs, &vb.sigs);
                     Ok(Value { sigs: sums, width: va.width })
                 }
+                BinOp::Sub => {
+                    // 减法：a + ~b + 1（**单条进位链**，结果模 2^N）
+                    let nb: Vec<usize> = vb.sigs.iter().map(|&s| nl.not(s)).collect();
+                    let one = nl.add_const(1);
+                    let (sums, _cout) = nl.adder_cin(&va.sigs, &nb, one);
+                    Ok(Value { sigs: sums, width: va.width })
+                }
+                BinOp::Lt => {
+                    let s = lower_lt(nl, &va, &vb);
+                    Ok(Value { sigs: vec![s], width: 1 })
+                }
+                BinOp::Gt => {
+                    let s = lower_lt(nl, &vb, &va);
+                    Ok(Value { sigs: vec![s], width: 1 })
+                }
+                BinOp::Le => {
+                    let s = lower_lt(nl, &vb, &va);
+                    let s = nl.not(s);
+                    Ok(Value { sigs: vec![s], width: 1 })
+                }
+                BinOp::Ge => {
+                    let s = lower_lt(nl, &va, &vb);
+                    let s = nl.not(s);
+                    Ok(Value { sigs: vec![s], width: 1 })
+                }
                 BinOp::Eq => {
                     // 等于：逐位 XNOR 再全部 AND。原型：N 位 → 输出 1 位。
                     let mut eq_sig = nl.add_const(1);
@@ -431,6 +456,17 @@ fn lower_expr(
             Ok(Value { sigs, width: vt.width })
         }
     }
+}
+
+/// 无符号比较 `a < b`（1 位）：单条进位链 `a + ~b + 1` 的进位取反。
+///
+/// 必须用单条进位链：把 `a + ~b + 1` 拆成两次加法会丢掉第一次的进位，
+/// 使借位判断错误（比较结果会错）。
+fn lower_lt(nl: &mut Netlist, a: &Value, b: &Value) -> usize {
+    let nb: Vec<usize> = b.sigs.iter().map(|&s| nl.not(s)).collect();
+    let one = nl.add_const(1);
+    let (_, carry) = nl.adder_cin(&a.sigs, &nb, one);
+    nl.not(carry)
 }
 
 fn need_width(a: &Value, b: &Value, sp: Span) -> LowerResult<()> {

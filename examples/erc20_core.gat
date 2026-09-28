@@ -1,0 +1,138 @@
+// ============================================================================
+// ERC-20 纯计算核心的形式化功能契约
+// ============================================================================
+//
+// 目标：对 OpenZeppelin ERC-20 中**可在 GateLang 纯计算模型内表达**的算术核心
+// 给出机器可检查的形式化证明。
+//
+// ## 诚实的作用域声明
+//
+// OpenZeppelin ERC-20 的完整语义包含 storage（`mapping(address => uint256)`）、
+// 事件、`msg.sender`、外部调用与 revert 行为 —— 这些**都不在** GateLang 的
+// 纯计算模型内，本文件**不**验证它们。本文件验证的是：
+//
+//   合约余额运算的**算术正确性**：checked 减法无下溢、checked 加法无溢出、
+//   以及转账后的余额守恒关系。
+//
+// 这对应 CertiK/Certora 公开属性中依赖算术的那一部分（TF-01/TF-02/TF-03 的
+// 数值层面），以及 OZ 0.8+ 内建溢出检查的形式化等价物。
+//
+// 位宽说明：原型用 Bits<16> 演示。真实 uint256 需要把语言位宽上限从 128 提升，
+// 并在规格层支持 256 位算术 —— 这是已知缺口，见 README。
+//
+// ## 刻意构造的对照实现
+//
+// `ERC20SubBuggy` 是**故意漏掉下溢检查**的版本（模拟 Solidity 0.7 及更早、
+// 或手写 unchecked 块的典型漏洞）。同一份规格应当：
+//   - 对 `ERC20SafeSub` **证明成立**
+//   - 对 `ERC20SubBuggy` **给出反例**
+// 这正是"证明驱动"相对"审计意见"的价值。
+
+// ---------------------------------------------------------------------------
+// 正确实现：checked 减法（等价于 OZ 0.8+ 的 `balance - amount`）
+// ---------------------------------------------------------------------------
+circuit ERC20SafeSub(a: Bits<16>, b: Bits<16>) -> (ok: Bit, d: Bits<16>) {
+    d = a - b;
+    ok = a >= b;
+    return (ok, d);
+}
+
+// ---------------------------------------------------------------------------
+// 漏洞实现：**故意漏掉** `a >= b` 检查（下溢漏洞）
+// ---------------------------------------------------------------------------
+circuit ERC20SubBuggy(a: Bits<16>, b: Bits<16>) -> (ok: Bit, d: Bits<16>) {
+    d = a - b;
+    ok = 1;
+    return (ok, d);
+}
+
+// ---------------------------------------------------------------------------
+// 正确实现：checked 加法（等价于 OZ 0.8+ 的 `balance + amount`）
+// ---------------------------------------------------------------------------
+circuit ERC20SafeAdd(a: Bits<16>, b: Bits<16>) -> (ok: Bit, s: Bits<16>) {
+    s = a + b;
+    ok = s >= a;
+    return (ok, s);
+}
+
+// ---------------------------------------------------------------------------
+// transfer 的余额更新（纯计算部分，不含 storage 读写与事件）
+// 对应 OZ `_transfer(from, to, value)` 中：
+//     fromBalance -= value;  toBalance += value;
+// 以及两处 checked 算术。
+// ---------------------------------------------------------------------------
+circuit ERC20Transfer(fromBal: Bits<16>, toBal: Bits<16>, amount: Bits<16>)
+    -> (ok: Bit, newFrom: Bits<16>, newTo: Bits<16>) {
+    newFrom = fromBal - amount;
+    newTo = toBal + amount;
+    ok = AND(fromBal >= amount, newTo >= toBal);
+    return (ok, newFrom, newTo);
+}
+// ---------------------------------------------------------------------------
+// 漏洞实现：to 侧加法**不做**溢出检查（模拟 unchecked 转账）
+// ---------------------------------------------------------------------------
+circuit ERC20TransferBuggy(fromBal: Bits<16>, toBal: Bits<16>, amount: Bits<16>)
+    -> (ok: Bit, newFrom: Bits<16>, newTo: Bits<16>) {
+    newFrom = fromBal - amount;
+    newTo = toBal + amount;
+    ok = fromBal >= amount;
+    return (ok, newFrom, newTo);
+}
+
+// ===========================================================================
+// 形式化功能契约（spec）
+//
+// 命名约定：spec 名的最后一段必须与目标 circuit 同名（与 verify.rs 的匹配规则一致）。
+// 每条 spec 用 postcondition 承载主属性、invariant 承载次属性。
+// ===========================================================================
+
+// --- 契约 C1：checked 减法**恰好**在下溢时失败 ---------------------------
+// post: `ok` 必须精确等于"无下溢" —— 既不漏报（漏检查 → 下溢漏洞），
+//       也不误报（合法转账被拒）。
+// inv : 存储的差值必须是模 2^16 的差。
+spec FCT.erc20.ERC20SafeSub {
+    precondition: true;
+    postcondition: ok == (a >= b);
+    invariant: d == (a - b) % (2^16);
+}
+
+// --- 契约 C2（应被驳倒）：漏洞版本的同一个契约 ---------------------------
+// 对 ERC20SubBuggy 而言 `ok == (a >= b)` 是**假命题**：
+// 它在 a < b 时仍返回 ok=1，正是典型的余额下溢漏洞。验证器必须给出反例。
+spec FCT.erc20.ERC20SubBuggy {
+    precondition: true;
+    postcondition: ok == (a >= b);
+    invariant: true;
+}
+
+// --- 契约 C3：checked 加法**恰好**在上溢时失败 ---------------------------
+spec FCT.erc20.ERC20SafeAdd {
+    precondition: true;
+    postcondition: ok == (a + b < 2^16);
+    invariant: s == (a + b) % (2^16);
+}
+
+// --- 契约 C4：transfer 的余额守恒 + 接收方确实入账 ----------------------
+// post: **核心安全不变量** —— transfer 不创造也不销毁代币。
+//       在模 2^16 算术下它对任意输入成立（无论成功失败，总量不变）。
+// inv : **条件式**（转账成功时才保证）：from 侧不增加；接收方恰好加上 amount。
+//
+// 契约精化记录：初版写成无条件 `newFrom <= fromBal`，被验证器驳倒 ——
+// 反例 fromBal=0, toBal=0, amount=0x8000（ok=false 时 newFrom 是模差值 0x8000）。
+// 那是**契约过强**而非实现缺陷：失败路径下余额本就不生效。改为 `!ok || ...`。
+spec FCT.erc20.ERC20Transfer {
+    precondition: true;
+    postcondition: (newFrom + newTo) % (2^16) == (fromBal + toBal) % (2^16);
+    invariant: (!ok || newFrom <= fromBal) && newTo == (toBal + amount) % (2^16);
+}
+
+// --- 契约 C5（应被驳倒）：漏洞转账的入账保证 -----------------------------
+// ERC20TransferBuggy 的 ok 只检查 from 侧，**不检查** to 侧加法溢出。
+// 因此在 fromBal >= amount（应当成功）但 toBal + amount 回绕时，
+// 接收方余额反而变小 —— 凭空销毁代币。此规格必须被驳倒。
+// 条件式表述确保反例落在"转账本应成功"的真实漏洞场景上。
+spec FCT.erc20.ERC20TransferBuggy {
+    precondition: true;
+    postcondition: !ok || newTo >= toBal;
+    invariant: true;
+}

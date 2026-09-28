@@ -164,8 +164,14 @@ pub enum BinOp {
     Or,
     Xor,
     Add,
+    Sub, // 减法（模 2^N，由单条进位链 a + ~b + 1 实现）
     Eq, // 比较（== 返回 Bit，可展开为 XNOR + AND）
     Ne,
+    /// 无符号比较，均返回 1 位（Bit）
+    Lt,
+    Gt,
+    Le,
+    Ge,
 }
 
 /// 规范块：spec Name { precondition:... postcondition:... edge_cases:[...] invariant:... }
