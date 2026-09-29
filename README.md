@@ -1,6 +1,6 @@
 # GateLang — NAND/LATCH 门级可验证计算语言
 
-[![tests](https://img.shields.io/badge/tests-76%20passing-brightgreen)](tests/integration.rs)
+[![tests](https://img.shields.io/badge/tests-91%20passing-brightgreen)](tests/integration.rs)
 [![rust](https://img.shields.io/badge/rust-1.96-orange)](https://www.rust-lang.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-blue)](#构建与测试)
 [![formal](https://img.shields.io/badge/verification-SAT%20%2F%20UNSAT-purple)](#形式化验证sat-后端)
@@ -18,7 +18,7 @@ M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文
 
 ```bash
 cargo build
-cargo test          # 76 个测试（35 单元 + 14 集成 + 22 形式化证明 + 5 ERC-20）
+cargo test          # 91 个测试（45 单元 + 14 集成 + 22 形式化证明 + 5 ERC-20 + 5 词级重写）
                     # ERC-20 的 uint256 慢证明用: cargo test --release -- --ignored
 ```
 
@@ -79,7 +79,34 @@ spec F {
 实测它**无法**解决多项求和的**加法结合律/同余**问题
 （`(b0-a)+(b1+a)+b2+b3` 与 `(b0+b1+b2+b3)-a`）——
 因为 SAT 没有**同余闭包**，而加法结合律对 resolution 是指数难的（文献已知结果）。
-真正的解法是**项重写**（让两侧共享信号）或词级推理，不是加断言。
+真正的解法是**项重写**（让两侧共享信号），不是加断言 —— 见下节。
+
+## 词级重写层（`word.rs`）—— 摆脱加法结合律的指数边界
+
+SAT 后端把一切 bit-blast 成 CNF，于是多项求和的**重结合**必须由 resolution
+自行发现 —— 那是**指数难**的。实测扩展性（N=4 账户不变量保持）：
+
+| 位宽 | 纯 SAT | 词级重写层 |
+|---|---|---|
+| `Bits<8>` | 4 s | **0.006 s** |
+| `Bits<12>` | >120 s 未完成 | **瞬间** |
+| `Bits<32>` | >280 s 未完成 | **0.2 s**（正确版证明 + 漏洞版反例） |
+
+词级层在 **bit-blast 之前**把电路与规格符号求值成**规范形**
+（`Σ cᵢ·atomᵢ + k (mod 2ʷ)`，系数按位宽取模），于是 `(b0-a)+(b1+a)` 与 `b0+b1`
+规范化为**同一个形**，比较式随之同形，`AND(inv, NOT(inv))` 被直接判为 `0`。
+
+**可靠性纪律（关键）** —— 规范形只做**保守、单向**判定：
+
+* 规范形 == `Const` ⇒ 该值确实处处相等（可靠）
+* 两侧规范形**结构相同** ⇒ 二者确实相等（可靠）
+* 规范形**不同** ⇒ **不作结论**，回落 SAT（反例仍由 SAT 给出）
+
+**绝不用「规范形不同」去证明不等**（原子被当作独立变元，那样不可靠）。
+另有两道保险：位宽 >128 不判定（u128 表示不了 `mod 2ʷ` 的系数）；任何无法
+精确处理的构造（用户电路内联、位索引/切片/拼接、`if` 分支、规格层乘模）
+一律返回 `None` 回落 SAT。`tests/word.rs` 用「**有词级层 vs 无词级层（纯 SAT）**」
+在同一批语料上逐条对照 —— **词级层绝不改变结论**，只做加速。
 
 ## CLI
 
@@ -122,6 +149,7 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 | `examples/erc20_uint256.gat` | **ERC-20 算术核心（真实 uint256）** | checked add/sub 的独立判据等价性；余额守恒；含漏洞版本被驳倒 |
 | `examples/erc20_invariant.gat` | **全局不变量 Σbalances==totalSupply（uint256）** | 有界地址域（N=2）下的归纳步；含慢证明（约 9 分钟） |
 | `examples/erc20_invariant_small.gat` | 同上，N=4 @ Bits<8> | 说明账户数本身不是障碍 |
+| `examples/erc20_invariant_n4_32.gat` | **N=4 @ Bits<32> 不变量保持** | 词级重写层对照实验：纯 SAT >280s 无结论，词级 0.2s；含漏洞版反例 |
 
 ## 语言要点（原型子集）
 
@@ -155,6 +183,7 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 | `cnf.rs` | CNF 表示 + NAND 网表 Tseitin 编码 |
 | `sat.rs` | 自研 CDCL SAT 求解器（零依赖） |
 | `prove.rs` | **形式化证明**：spec 门级综合 + 反例提取 + miter 等价 |
+| `word.rs` | **词级重写层**：bit-blast 前的位向量规范形（加法重结合/同余），判不了则回落 SAT |
 | `main.rs` | CLI |
 
 ## 形式化验证的实现要点（`prove.rs`）

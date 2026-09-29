@@ -26,5 +26,6 @@ pub mod sim;
 pub mod spec;
 pub mod ty;
 pub mod verify;
+pub mod word;
 
 pub use parser::parse_program;

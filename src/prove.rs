@@ -22,12 +22,13 @@
 
 use std::collections::HashMap;
 
-use crate::ast::{Decl, Spec};
+use crate::ast::{Circuit, Decl, Spec};
 use crate::cnf::{encode_netlist, Cnf, Lit};
 use crate::lower::Compiled;
 use crate::netlist::{Netlist, Sig};
 use crate::sat::{SatStats, SolveResult, Solver};
 use crate::spec::{parse_spec, SpecExpr};
+use crate::word;
 
 /// 规格算术的机器宽度。与 `spec::eval_spec` 的 `u128` 表示一致。
 pub const BV_W: usize = 128;
@@ -666,8 +667,20 @@ pub fn synthesize_expr(compiled: &Compiled, expr: &SpecExpr) -> Result<(Netlist,
     Ok((nl, sig))
 }
 
-/// 对单个 spec 执行形式化证明。
+/// 对单个 spec 执行形式化证明（不启用词级快捷键，仅 SAT 路径）。
 pub fn prove_spec(compiled: &Compiled, spec: &Spec) -> Result<ProveReport, String> {
+    prove_spec_full(compiled, None, spec)
+}
+
+/// 对单个 spec 执行形式化证明，可选传入**电路 AST** 以启用词级重写快捷键。
+///
+/// 词级路径只做保守判定：能证明时直接返回；不能证明时**完全回落**到既有 SAT
+/// 路径，因此不改变任何既有语义（见 `word.rs` 的可靠性纪律）。
+pub fn prove_spec_full(
+    compiled: &Compiled,
+    circuit_ast: Option<&Circuit>,
+    spec: &Spec,
+) -> Result<ProveReport, String> {
     let mut rep = ProveReport { circuit: spec.name.clone(), obligations: Vec::new(), pre_unsatisfiable: false };
 
     // 与 verify.rs 对等：缺少 postcondition 时不得计为"通过"、也不得静默降级
@@ -701,6 +714,37 @@ pub fn prove_spec(compiled: &Compiled, spec: &Spec) -> Result<ProveReport, Strin
         if s.solve() == SolveResult::Unsat {
             rep.pre_unsatisfiable = true;
             return Ok(rep);
+        }
+    }
+
+    // ---------- 词级重写快捷键（在 bit-blast 之前）----------
+    //
+    // 目的：多项求和的加法结合律/同余对 resolution 是指数难的
+    // （N=4 @ Bits<32> 的 SAT 路径 >240s 未完成）。词级层用位向量代数把
+    // 电路与规格符号求值成规范形，能在词级判为恒真时直接出结论。
+    //
+    // 仅在 **无 cut、无非平凡 invariant** 时启用：
+    // `cut` 的语义（先独立证割点、再作为假设加入主证明）由 SAT 路径编排，
+    // 这里不重复实现，以免报告缺失割点义务（那会削弱 `all_proven` 的可靠性）。
+    let invariant_is_trivial = match &spec.invariant {
+        None => true,
+        Some(t) => matches!(parse_spec(t), Ok(SpecExpr::Num(1))),
+    };
+    if spec.cut.is_none() && invariant_is_trivial {
+        if let (Some(circ), Some(post_txt)) = (circuit_ast, &spec.post) {
+            let post_e = parse_spec(post_txt)?;
+            if word::word_prove(circ, pre.as_ref(), &post_e) == Some(true) {
+                rep.obligations.push(Obligation {
+                    kind: "postcondition".to_string(),
+                    statement: post_txt.clone(),
+                    verdict: Verdict::Proven,
+                    // 词级重写未构造 CNF：规模为 0，与实际 SAT 义务可区分
+                    stats: SatStats::default(),
+                    cnf_vars: 0,
+                    cnf_clauses: 0,
+                });
+                return Ok(rep);
+            }
         }
     }
 
@@ -768,7 +812,15 @@ pub fn prove_all(decls: &[Decl], compiled: &[Compiled]) -> Vec<Result<ProveRepor
             _ => None,
         })
         .map(|s| match find_target(compiled, s) {
-            Some(t) => prove_spec(t, s),
+            Some(t) => {
+                // 取与编译产物同名的 circuit AST，启用词级重写快捷键
+                let cname = name_of(t);
+                let cast = decls.iter().find_map(|d| match d {
+                    Decl::Circuit(c) if c.name == cname => Some(c),
+                    _ => None,
+                });
+                prove_spec_full(t, cast, s)
+            }
             None => Err(format!("{}: 未找到对应声明", s.name)),
         })
         .collect()

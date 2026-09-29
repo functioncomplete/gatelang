@@ -1,0 +1,62 @@
+// ============================================================================
+// N = 4 账户不变量保持 @ Bits<32> —— 词级重写层的对照实验
+// ============================================================================
+//
+// ## 为什么单独成文件
+//
+// `erc20_invariant_small.gat` 的 N=4 版本在 `Bits<8>` 下 SAT 需 4 秒；
+// 实测（《GateLang ERC-20 形式化验证报告》§7.2.1）该问题随位宽**指数爆炸**：
+//   Bits<8> 4s  →  Bits<12> >120s  →  Bits<32> >240s 未完成
+// 根因是多项求和的**加法结合律/同余**对 resolution 是指数难的（SAT 无同余闭包）。
+//
+// 本文件把 N=4 提到 `Bits<32>`，作为「词级重写层」的验收场景：
+// 词级层应在 bit-blast 之前把两侧规范化为同一形，从而**瞬间**判证。
+//
+// ## 两个电路
+//
+// * `ERC20Step4x32`      —— 正确实现（加减相消）：**应被证明**
+// * `ERC20Step4x32Buggy` —— 刻意漏洞（to 侧误用减法）：**应被驳倒**
+//   这条是**负面对照**：证明词级层不会把错误实现"证明"为正确。
+
+// ---------------------------------------------------------------------------
+// 正确实现：transfer(0 → 1, amount)
+//   invAfter = ((b0-amount) + (b1+amount) + b2 + b3) == total
+// 词级恒等式：(b0-amount)+(b1+amount) ≡ b0+b1  (mod 2^32) ⇒ invAfter ≡ invBefore
+// ---------------------------------------------------------------------------
+circuit ERC20Step4x32(
+    b0: Bits<32>, b1: Bits<32>, b2: Bits<32>, b3: Bits<32>,
+    total: Bits<32>, amount: Bits<32>
+) -> (violation: Bit) {
+    invBefore = (b0 + b1 + b2 + b3) == total;
+    invAfter = (((b0 - amount) + (b1 + amount)) + b2 + b3) == total;
+    violation = AND(invBefore, NOT(invAfter));
+    return violation;
+}
+
+spec FCT.erc20.ERC20Step4x32 {
+    precondition: true;
+    postcondition: violation == 0;
+    invariant: true;
+}
+
+// ---------------------------------------------------------------------------
+// 漏洞实现：to 侧误用减法（应为加法）
+//   真实后果：转账使接收方余额减少 ⇒ 代币被"销毁"，Σ 不守恒。
+// 反例应满足 invBefore 且违反 invAfter。
+// ---------------------------------------------------------------------------
+circuit ERC20Step4x32Buggy(
+    b0: Bits<32>, b1: Bits<32>, b2: Bits<32>, b3: Bits<32>,
+    total: Bits<32>, amount: Bits<32>
+) -> (violation: Bit) {
+    invBefore = (b0 + b1 + b2 + b3) == total;
+    // BUG: b1 - amount（应为 b1 + amount）
+    invAfter = (((b0 - amount) + (b1 - amount)) + b2 + b3) == total;
+    violation = AND(invBefore, NOT(invAfter));
+    return violation;
+}
+
+spec FCT.erc20.ERC20Step4x32Buggy {
+    precondition: true;
+    postcondition: violation == 0;
+    invariant: true;
+}
