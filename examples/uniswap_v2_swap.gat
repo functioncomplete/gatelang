@@ -1,0 +1,98 @@
+// ============================================================================
+// Uniswap V2 `_swap` 不变量的形式化审计（GateLang 多项式层）
+// ============================================================================
+//
+// ## 审计对象
+//
+// Uniswap V2 `UniswapV2Pair._swap` 末尾的 K 检查：
+//
+//     balance0Adjusted = balance0 * 1000 - amount0In * 3;
+//     balance1Adjusted = balance1 * 1000 - amount1In * 3;
+//     require(balance0Adjusted * balance1Adjusted >= reserve0 * reserve1 * 1000**2);
+//
+// 它保证的是 **0.3% 手续费下恒定乘积 `k = R0·R1` 不下降** ——
+// 即「LP 的份额价值不被套利者抽走」。这是 AMM 的核心安全性质。
+//
+// ## 定理（整数语义）
+//
+//   设单侧换入 `dIn`、换出 `dOut`，且 `dOut` 是带费下单量的**有效上界**：
+//
+//       dOut * (1000*R0 + 997*dIn) <= 997*dIn*R1        （0.3% 费）
+//       dOut <= R1                                       （不可超发）
+//
+//   则换后恒定乘积不下降：
+//
+//       (R0 + dIn) * (R1 - dOut) >= R0 * R1
+//
+// 证明是纯代数的（Farkas 风格证书），**不需要除法**：
+//
+//       997·(目标 - R0·R1 的余量) - (假设的余量) = 3·R0·dOut >= 0
+//
+// ## ⚠ 工具边界（诚实声明）
+//
+// GateLang 的 `circuit` 表达式**没有 `*`**（乘法只存在于 spec 层），
+// 而本定理的全部内容就是乘法。因此下面的电路只提供**带位宽的接口**
+// （顺带定义变量上界），真正的证明在 spec 的多项式层完成。
+//
+// 审计范围：**一步 swap 的算术安全**。不含 storage / msg.sender / 重入 /
+// 事件 / 跨交易状态 —— 与 ERC-20 报告 §1.2 的边界一致。
+
+// ---------------------------------------------------------------------------
+// 定理 1：k 不下降（核心安全性质）
+// ---------------------------------------------------------------------------
+circuit UniswapV2KNonDecreasing(
+    R0: Bits<32>, R1: Bits<32>, dIn: Bits<32>, dOut: Bits<32>
+) -> (ok: Bit) {
+    ok = (R0 == R0);
+    return ok;
+}
+
+spec T.UniswapV2KNonDecreasing {
+    precondition: dOut * (1000*R0 + 997*dIn) <= 997*dIn*R1 && dOut <= R1;
+    postcondition: (R0 + dIn) * (R1 - dOut) >= R0 * R1;
+    invariant: true;
+}
+
+// ---------------------------------------------------------------------------
+// 定理 2：反方向 swap（token1 → token0）同样保持
+//
+// 与定理 1 同构（只是 R0/R1 互换），列出来是为了说明**两个方向都被覆盖**，
+// 而不是只证了其中一个。
+// ---------------------------------------------------------------------------
+circuit UniswapV2ReverseDirection(
+    R0: Bits<32>, R1: Bits<32>, dIn: Bits<32>, dOut: Bits<32>
+) -> (ok: Bit) {
+    ok = (R1 == R1);
+    return ok;
+}
+
+spec T.UniswapV2ReverseDirection {
+    precondition: dOut * (1000*R1 + 997*dIn) <= 997*dIn*R0 && dOut <= R0;
+    postcondition: (R1 + dIn) * (R0 - dOut) >= R0 * R1;
+    invariant: true;
+}
+
+// ---------------------------------------------------------------------------
+// 定理 3：换后守恒恒等式（可组合性引理）
+//
+//   (R0 + dIn)·(R1 − dOut) + dOut·(R0 + dIn)  ==  R0·R1 + dIn·R1
+//
+// 左 = (R0+dIn)·((R1−dOut)+dOut) = (R0+dIn)·R1 = 右。它把「换后乘积」与
+// 「换出量」分开记账，是把主定理接进跨笔收益核算时的标准改写。
+//
+// 注意写法：**不用顶层减法**。多项式层要求每个 `A − B` 都有 `B <= A` 守卫，
+// 否则无法保证 u128 无回绕（这正是它可靠的原因）。这里只有 `R1 − dOut`，
+// 已由 precondition 的 `dOut <= R1` 守卫。
+// ---------------------------------------------------------------------------
+circuit UniswapV2Conservation(
+    R0: Bits<32>, R1: Bits<32>, dIn: Bits<32>, dOut: Bits<32>
+) -> (ok: Bit) {
+    ok = (dOut <= R1);
+    return ok;
+}
+
+spec T.UniswapV2Conservation {
+    precondition: dOut <= R1;
+    postcondition: (R0 + dIn) * (R1 - dOut) + dOut * (R0 + dIn) == R0 * R1 + dIn * R1;
+    invariant: true;
+}

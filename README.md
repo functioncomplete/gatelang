@@ -1,6 +1,6 @@
 # GateLang — NAND/LATCH 门级可验证计算语言
 
-[![tests](https://img.shields.io/badge/tests-104%20passing-brightgreen)](tests/integration.rs)
+[![tests](https://img.shields.io/badge/tests-122%20passing-brightgreen)](tests/integration.rs)
 [![rust](https://img.shields.io/badge/rust-1.96-orange)](https://www.rust-lang.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-blue)](#构建与测试)
 [![formal](https://img.shields.io/badge/verification-SAT%20%2F%20UNSAT-purple)](#形式化验证sat-后端)
@@ -18,7 +18,8 @@ M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文
 
 ```bash
 cargo build
-cargo test          # 104 个测试（55 单元 + 14 集成 + 22 形式化证明 + 6 ERC-20 + 7 词级重写）
+cargo test          # 122 个测试（67 单元 + 14 集成 + 22 形式化证明 + 6 ERC-20
+                    #            + 7 词级重写 + 6 多项式/Uniswap）
                     # 已无 ignored 测试（原 9 分钟的 uint256 证明由词级层降至秒级）
 ```
 
@@ -110,6 +111,45 @@ SAT 后端把一切 bit-blast 成 CNF，于是多项求和的**重结合**必须
 一律返回 `None` 回落 SAT。`tests/word.rs` 用「**有词级层 vs 无词级层（纯 SAT）**」
 在同一批语料上逐条对照 —— **词级层绝不改变结论**，只做加速。
 
+## 多项式/不等式层（`poly.rs`）—— 审计非线性不变量（Uniswap V2）
+
+词级层只处理**仿射**；主流 DeFi 的核心是**乘除法**（Uniswap 的 `x·y=k`、
+Aave 健康因子、ERC-4626 份额）。而规格层的乘法通用路径**无视实际位宽、
+永远按 128 位展开**，连 4 位变量的乘法都超预算：
+
+```
+$ gatelang multest.gat --prove      # postcondition: a * b == b * a
+  ✗ 乘法综合超出预算
+```
+
+本层换一条路：**在多项式层面推理**，不构造乘法器、也不 bit-blast。
+把 `*` 按分配律展开成 `Σ c·M + k`（M 为变量下标的升序多重集），于是
+**恒等式**直接判证；**不等式**用 Farkas 风格证书判证：
+
+```
+目标 G >= 0，假设 Dⱼ >= 0；找 k>0、mⱼ>=0 使 k·G − Σ mⱼ·Dⱼ 全系数非负
+```
+
+`tests/poly.rs` 的 Uniswap V2 验收（`examples/uniswap_v2_swap.gat`）：
+
+| 定理 | 纯 SAT | 多项式层 |
+|---|---|---|
+| k 不下降（含 0.3% 费） | `✗ 乘法综合超出预算`（无法尝试） | ✅ **已证明**（CNF 0） |
+| 反向 swap 同样保持 | 同上 | ✅ **已证明** |
+| 换后守恒恒等式 | 同上 | ✅ **已证明** |
+
+**可靠性纪律（关键）** —— 本层在**整数**上推理，因此必须证明「规格的 u128
+回绕语义 == 整数值」：
+
+* 变量上界默认取端口位宽；`x <= C` / `x < 2^k` 可收紧
+* 每条比较的两侧都做**区间分析**（checked 算术），任何一步溢出即 **bail**
+* `a - b` 必须有 `b <= a` **守卫**才放行，否则 bail
+* 找不出证书即返回 `None` 回落 SAT；**绝不返回"假"**（反例由 SAT 给出）
+
+两道保险都有专门测试：`subtraction_without_guard_bails`、`potential_wrap_bails`；
+`over_permissive_bound_is_not_proven` 是负面对照（约束放宽一倍后必须判不了）；
+`uniswap_precondition_is_satisfiable` 给出**非空域见证**，防"空域上的空洞证明"。
+
 ## CLI
 
 ```bash
@@ -153,6 +193,7 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 | `examples/erc20_invariant_small.gat` | 同上，N=4 @ Bits<8> | 说明账户数本身不是障碍 |
 | `examples/erc20_invariant_n4_32.gat` | **N=4 @ Bits<32> 不变量保持** | 词级重写层对照实验：纯 SAT >280s 无结论，词级 0.2s；含漏洞版反例 |
 | `examples/erc20_invariant_n4_256.gat` | **N=4 @ 真实 uint256 不变量保持** | 报告判定「纯 SAT 完全不可达」的场景，词级层直接证明 |
+| `examples/uniswap_v2_swap.gat` | **Uniswap V2 `_swap` 不变量** | k 不下降（含 0.3% 费）+ 反向 + 守恒恒等式；多项式层证明（CNF 0） |
 
 ## 语言要点（原型子集）
 
@@ -188,6 +229,7 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 | `prove.rs` | **形式化证明**：spec 门级综合 + 反例提取 + miter 等价 |
 | `word.rs` | **词级重写层**：bit-blast 前的位向量规范形（加法重结合/同余），判不了则回落 SAT |
 | `u256.rs` | 零依赖 256 位无符号整数（`mod 2ʷ` 系数/常量），供词级层覆盖真实 `uint256` |
+| `poly.rs` | **多项式/不等式层**：分配律展开 + Farkas 风格证书，用于 AMM 类**非线性**不变量（Uniswap `x·y=k`） |
 | `main.rs` | CLI |
 
 ## 形式化验证的实现要点（`prove.rs`）

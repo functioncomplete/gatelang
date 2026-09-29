@@ -18,6 +18,7 @@ pub mod fct;
 pub mod lexer;
 pub mod lower;
 pub mod netlist;
+pub mod poly;
 pub mod parser;
 pub mod prove;
 pub mod resource;

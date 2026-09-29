@@ -25,7 +25,9 @@ use std::collections::HashMap;
 use crate::ast::{Circuit, Decl, Spec};
 use crate::cnf::{encode_netlist, Cnf, Lit};
 use crate::lower::Compiled;
+use crate::ast::Param;
 use crate::netlist::{Netlist, Sig};
+use crate::poly;
 use crate::sat::{SatStats, SolveResult, Solver};
 use crate::spec::{parse_spec, SpecExpr};
 use crate::word;
@@ -447,6 +449,21 @@ fn port_env(nl: &Netlist, compiled: &Compiled) -> Result<HashMap<String, Vec<Sig
     Ok(env)
 }
 
+/// 规格层的变量域：组合电路的输入 + 输出（名字 + 位宽）。
+///
+/// 位宽给出**变量上界**（`Bits<N>` → `< 2^N`），是多项式层判断
+/// 「规格 u128 运算无回绕」的依据。
+fn spec_ports(compiled: &Compiled) -> Option<Vec<Param>> {
+    match compiled {
+        Compiled::Combinational { inputs, outputs, .. } => {
+            let mut v = inputs.clone();
+            v.extend(outputs.iter().cloned());
+            Some(v)
+        }
+        Compiled::State { .. } => None,
+    }
+}
+
 /// 把模型中的一段位按 LSB-first 渲染为 `0x…` 十六进制。
 ///
 /// **不做 u128 截断** —— 256 位端口的反例必须完整显示，否则会误导排障。
@@ -701,19 +718,23 @@ pub fn prove_spec_full(
         let mut nl = base_nl.clone();
         let env = port_env(base_nl, compiled)?;
         let mut synth = Synth::new(&mut nl, env);
-        let pv = synth.encode(pe)?;
-        let psig = synth.to_bool(&pv);
-        if synth.over_budget() {
-            return Err("前置条件综合超出预算".into());
-        }
-        let enc = encode_netlist(&nl);
-        let mut c = enc.cnf.clone();
-        let v = enc.var_of(psig).ok_or("pre 信号无变量")?;
-        c.add_unit(v);
-        let mut s = Solver::new(&c);
-        if s.solve() == SolveResult::Unsat {
-            rep.pre_unsatisfiable = true;
-            return Ok(rep);
+        // 前置含乘法/取模时无法门级综合（如 AMM 不变量的 `dOut*(...) <= ...`）。
+        // 此时**跳过**「前置可满足性」检查，而不是让整个证明报错 ——
+        // 否则永远走不到后面的词级 / 多项式路径。综合成功时行为不变。
+        if let Ok(pv) = synth.encode(pe) {
+            let psig = synth.to_bool(&pv);
+            if synth.over_budget() {
+                return Err("前置条件综合超出预算".into());
+            }
+            let enc = encode_netlist(&nl);
+            let mut c = enc.cnf.clone();
+            let v = enc.var_of(psig).ok_or("pre 信号无变量")?;
+            c.add_unit(v);
+            let mut s = Solver::new(&c);
+            if s.solve() == SolveResult::Unsat {
+                rep.pre_unsatisfiable = true;
+                return Ok(rep);
+            }
         }
     }
 
@@ -744,6 +765,32 @@ pub fn prove_spec_full(
                     cnf_clauses: 0,
                 });
                 return Ok(rep);
+            }
+        }
+    }
+
+    // ---------- 多项式/不等式路径（非线性，整数语义）----------
+    //
+    // 词级层只处理**仿射**；主流 DeFi 的不变量是**乘法不等式**
+    // （Uniswap 的 `x·y=k`）。`prove.rs` 的规格乘法通用路径无视位宽、
+    // 永远按 128 位展开 → 连 4 位变量乘法都超预算（实测 `乘法综合超出预算`）。
+    // 本路径在多项式层面用 Farkas 风格证书判定，不构造乘法器、不 bit-blast。
+    // 无法判定时回落 SAT。
+    if spec.cut.is_none() && invariant_is_trivial {
+        if let Some(post_txt) = &spec.post {
+            let post_e = parse_spec(post_txt)?;
+            if let Some(ports) = spec_ports(compiled) {
+                if poly::prove_inequality(&ports, pre.as_ref(), &post_e) == Some(true) {
+                    rep.obligations.push(Obligation {
+                        kind: "postcondition".to_string(),
+                        statement: post_txt.clone(),
+                        verdict: Verdict::Proven,
+                        stats: SatStats::default(),
+                        cnf_vars: 0,
+                        cnf_clauses: 0,
+                    });
+                    return Ok(rep);
+                }
             }
         }
     }
