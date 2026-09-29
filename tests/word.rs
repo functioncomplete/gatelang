@@ -108,6 +108,58 @@ fn buggy_circuit_is_not_word_proven() {
     );
 }
 
+/* ===================== 核心验收：N=4 @ 真实 uint256 ===================== */
+
+/// 报告 §7.2.1 判定「纯 SAT 完全不可达」的场景：
+/// **N=4 账户、真实 uint256（256 位）** 的不变量保持。
+///
+/// 纯 SAT 在此没有可行路径（多项重结合 + 256 位）；词级重写层应在
+/// bit-blast 之前规范化判证（CNF 规模 0）。
+#[test]
+fn n4_uint256_is_word_proven() {
+    let src = include_str!("../examples/erc20_invariant_n4_256.gat");
+    let (decls, compiled) = compile(src);
+    let rs = prove_all(&decls, &compiled);
+    let rep = rs[0].as_ref().expect("不应报错");
+    assert!(
+        rep.all_proven(),
+        "N=4 @ uint256 应被证明，实际 {:?}",
+        rep.obligations
+    );
+    assert_eq!(rep.obligations[0].cnf_vars, 0, "应走词级重写路径");
+}
+
+/// 256 位下的**负面对照**：漏洞实现（to 侧误用减法）不得被词级层判证。
+///
+/// 用词级接口直接断言，避免在 256 位下让 SAT 去找反例（那本身就可能是长时间搜索）。
+#[test]
+fn buggy_uint256_is_not_word_proven() {
+    let src = r#"
+circuit Buggy256(
+    b0: Bits<256>, b1: Bits<256>, b2: Bits<256>, b3: Bits<256>,
+    total: Bits<256>, amount: Bits<256>
+) -> (violation: Bit) {
+    invBefore = (b0 + b1 + b2 + b3) == total;
+    invAfter = (((b0 - amount) + (b1 - amount)) + b2 + b3) == total;
+    violation = AND(invBefore, NOT(invAfter));
+    return violation;
+}
+
+spec T.Buggy256 {
+    precondition: true;
+    postcondition: violation == 0;
+    invariant: true;
+}
+"#;
+    let (decls, _) = compile(src);
+    let post = parse_spec("violation == 0").unwrap();
+    assert_eq!(
+        word::word_prove(circ(&decls, "Buggy256"), None, &post),
+        None,
+        "256 位漏洞实现不得被词级层判真（必须回落 SAT）"
+    );
+}
+
 /* ===================== 可靠性：词级层绝不改变结论 ===================== */
 
 /// 对既有语料逐条对照「有词级层」与「无词级层（纯 SAT）」的结论。

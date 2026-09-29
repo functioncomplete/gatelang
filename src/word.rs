@@ -25,29 +25,26 @@
 //! （`coerce` 零扩展、`need_width` 严格等宽、比较降为 1 位、按位门逐位）。
 //! 任何无法精确处理的构造一律**返回 `None`**（回落 SAT），绝不猜测。
 //! `tests/word.rs` 用随机电路把词级求值与网表模拟逐条交叉验证。
+//!
+//! ## 位宽
+//!
+//! 系数与常量用 [`U256`] 表示（`mod 2ʷ`，w ≤ 256），因此**真实 uint256**
+//! 电路也走词级路径 —— 这正是 N≥4 @ uint256 唯一可行的路径。
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ast::{BinOp, Circuit, Expr, Stmt, Target};
 use crate::spec::SpecExpr;
+use crate::u256::U256;
 
 /// 规格算术的机器宽度（与 `prove.rs::BV_W` 一致）。
 pub const SPEC_W: u32 = 128;
 
-/// 位宽门槛：u128 无法表示 `mod 2^w (w>128)` 的系数与常量，故 >128 位一律不判定。
-const MAX_WORD_W: u32 = 128;
+/// 位宽门槛：`U256` 能表示 `mod 2ʷ (w ≤ 256)` 的系数与常量；更宽不判定。
+const MAX_WORD_W: u32 = 256;
 
-fn mask(w: u32) -> u128 {
-    if w >= 128 {
-        u128::MAX
-    } else {
-        (1u128 << w) - 1
-    }
-}
-
-/// 按位宽取模（仅对 w ≤ 128 有意义；调用方有门槛）。
-fn norm(w: u32, v: u128) -> u128 {
-    v & mask(w)
+fn norm(w: u32, v: U256) -> U256 {
+    v.and_mask(w)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -74,11 +71,11 @@ pub enum CmpOp {
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum C {
     /// 位宽 + 值（已按位宽掩码）
-    Const(u32, u128),
+    Const(u32, U256),
     /// 位宽 + 名字（端口/输入）
     Var(u32, String),
     /// `Σ coeffᵢ·atomᵢ + k`（mod 2^width）：atom 已排序去重、系数非零
-    Sum(u32, Vec<(u128, C)>, u128),
+    Sum(u32, Vec<(U256, C)>, U256),
     /// 位运算（`And`/`Or`/`Xor` 已展平去重；`Not` 一元；`ToBool` 归约）
     Bits(u32, BitOp, Vec<C>),
     /// 比较，结果恒 1 位（第一个字段是**操作数**位宽）
@@ -107,43 +104,49 @@ pub fn width(c: &C) -> u32 {
 
 /* ============================ 构造子（语义对齐 lower.rs） ============================ */
 
-fn cst(w: u32, v: u128) -> C {
+fn cst(w: u32, v: U256) -> C {
     C::Const(w, norm(w, v))
 }
 
+fn cst_u128(w: u32, v: u128) -> C {
+    cst(w, U256::from_u128(v))
+}
+
 /// 加法：`Σ + k`，展平嵌套 `Sum`、合并同类项、系数按位宽取模。
-fn add_all(w: u32, parts: Vec<(u128, C)>, k: u128) -> C {
-    let mut acc: BTreeMap<C, u128> = BTreeMap::new();
+fn add_all(w: u32, parts: Vec<(U256, C)>, k: U256) -> C {
+    let mut acc: BTreeMap<C, U256> = BTreeMap::new();
     let mut kk = norm(w, k);
     for (coef, t) in parts {
         let coef = norm(w, coef);
-        if coef == 0 {
+        if coef.is_zero() {
             continue;
         }
         match t {
             C::Const(tw, v) if tw == w => {
-                kk = norm(w, kk.wrapping_add(coef.wrapping_mul(v)));
+                kk = norm(w, kk.add(coef.mul(v)));
             }
             C::Sum(tw, subs, sk) if tw == w => {
-                kk = norm(w, kk.wrapping_add(coef.wrapping_mul(sk)));
+                kk = norm(w, kk.add(coef.mul(sk)));
                 for (c2, a2) in subs {
-                    let e = acc.entry(a2).or_insert(0);
-                    *e = norm(w, e.wrapping_add(coef.wrapping_mul(c2)));
+                    let e = acc.entry(a2).or_insert(U256::ZERO);
+                    let cur = *e;
+                    *e = norm(w, cur.add(coef.mul(c2)));
                 }
             }
             other => {
-                let e = acc.entry(other).or_insert(0);
-                *e = norm(w, e.wrapping_add(coef));
+                let e = acc.entry(other).or_insert(U256::ZERO);
+                let cur = *e;
+                *e = norm(w, cur.add(coef));
             }
         }
     }
-    acc.retain(|_, c| *c != 0);
+    acc.retain(|_, c| !c.is_zero());
     if acc.is_empty() {
         return C::Const(w, kk);
     }
-    if acc.len() == 1 && kk == 0 {
+    if acc.len() == 1 && kk.is_zero() {
         if let Some((a, &c)) = acc.iter().next() {
-            if c == 1 {
+            if c.is_one() {
                 return a.clone();
             }
         }
@@ -152,14 +155,15 @@ fn add_all(w: u32, parts: Vec<(u128, C)>, k: u128) -> C {
 }
 
 fn add(w: u32, a: C, b: C) -> C {
-    add_all(w, vec![(1, a), (1, b)], 0)
+    add_all(w, vec![(U256::ONE, a), (U256::ONE, b)], U256::ZERO)
 }
 
+/// `a - b`：以系数 `−1 ≡ 2ʷ−1` 表示（与词级规范形的减法一致）。
 fn sub(w: u32, a: C, b: C) -> C {
-    add_all(w, vec![(1, a), (mask(w), b)], 0)
+    add_all(w, vec![(U256::ONE, a), (U256::mask(w), b)], U256::ZERO)
 }
 
-/// 零扩展到 `to` 位。
+/// 零扩展到 `to` 位（要求 `to ≥ x.width()`）。
 fn zext(to: u32, x: C) -> C {
     if x.width() == to {
         return x;
@@ -189,11 +193,12 @@ fn bits(w: u32, op: BitOp, ops: Vec<C>) -> C {
         BitOp::Not => {
             let x = match ops.into_iter().next() {
                 Some(x) => x,
-                None => return C::Const(w, 0),
+                None => return C::Const(w, U256::ZERO),
             };
             if let C::Const(tw, v) = &x {
                 if *tw == w {
-                    return C::Const(w, norm(w, !*v));
+                    // 按位取反 == 与 `2ʷ−1` 异或
+                    return C::Const(w, v.xor(U256::mask(w)));
                 }
             }
             if let C::Bits(tw, BitOp::Not, inner) = &x {
@@ -206,10 +211,10 @@ fn bits(w: u32, op: BitOp, ops: Vec<C>) -> C {
         BitOp::ToBool => {
             let x = match ops.into_iter().next() {
                 Some(x) => x,
-                None => return C::Const(1, 0),
+                None => return C::Const(1, U256::ZERO),
             };
             match &x {
-                C::Const(tw, v) => C::Const(1, (norm(*tw, *v) != 0) as u128),
+                C::Const(tw, v) => C::Const(1, if norm(*tw, *v).is_zero() { U256::ZERO } else { U256::ONE }),
                 C::Cmp(..) => x,
                 _ if x.width() == 1 => x,
                 _ => C::Bits(1, BitOp::ToBool, vec![x]),
@@ -219,11 +224,16 @@ fn bits(w: u32, op: BitOp, ops: Vec<C>) -> C {
             // 展平 + 奇偶消去（x ^ x = 0）
             let mut stack = ops;
             let mut parity: BTreeMap<C, bool> = BTreeMap::new();
-            let mut k: Option<u128> = None;
+            let mut k: Option<U256> = None;
             while let Some(o) = stack.pop() {
                 match o {
                     C::Bits(w2, BitOp::Xor, inner) if w2 == w => stack.extend(inner),
-                    C::Const(tw, v) if tw == w => k = Some(k.map_or(v, |a| a ^ v)),
+                    C::Const(tw, v) if tw == w => {
+                        k = Some(match k {
+                            None => norm(w, v),
+                            Some(a) => a.xor(v),
+                        })
+                    }
                     other => {
                         let e = parity.entry(other).or_insert(false);
                         *e = !*e;
@@ -237,14 +247,13 @@ fn bits(w: u32, op: BitOp, ops: Vec<C>) -> C {
                 .collect();
             rest.sort();
             if let Some(kv) = k {
-                let kv = norm(w, kv);
-                if kv != 0 {
+                if !kv.is_zero() {
                     rest.push(C::Const(w, kv));
                 }
             }
             rest.sort();
             if rest.is_empty() {
-                return C::Const(w, 0);
+                return C::Const(w, U256::ZERO);
             }
             if rest.len() == 1 {
                 return rest.pop().unwrap();
@@ -252,7 +261,7 @@ fn bits(w: u32, op: BitOp, ops: Vec<C>) -> C {
             C::Bits(w, BitOp::Xor, rest)
         }
         BitOp::And | BitOp::Or => {
-            let ident = if op == BitOp::And { mask(w) } else { 0 };
+            let ident = if op == BitOp::And { U256::mask(w) } else { U256::ZERO };
             let mut flat: Vec<C> = Vec::new();
             for o in ops {
                 match o {
@@ -260,15 +269,15 @@ fn bits(w: u32, op: BitOp, ops: Vec<C>) -> C {
                     other => flat.push(other),
                 }
             }
-            let mut konst: Option<u128> = None;
+            let mut konst: Option<U256> = None;
             let mut rest: Vec<C> = Vec::new();
             for o in flat {
                 match &o {
                     C::Const(tw, v) if *tw == w => {
                         konst = Some(match (konst, op) {
                             (None, _) => *v,
-                            (Some(k), BitOp::And) => k & *v,
-                            (Some(k), BitOp::Or) => k | *v,
+                            (Some(k), BitOp::And) => k.and(*v),
+                            (Some(k), BitOp::Or) => k.or(*v),
                             (Some(k), _) => k,
                         });
                     }
@@ -278,18 +287,18 @@ fn bits(w: u32, op: BitOp, ops: Vec<C>) -> C {
             rest.sort();
             rest.dedup();
             if op == BitOp::And {
-                if konst == Some(0) {
-                    return C::Const(w, 0);
+                if konst == Some(U256::ZERO) {
+                    return C::Const(w, U256::ZERO);
                 }
                 if has_complement(&rest, w) {
-                    return C::Const(w, 0);
+                    return C::Const(w, U256::ZERO);
                 }
             } else {
-                if konst == Some(mask(w)) {
-                    return C::Const(w, mask(w));
+                if konst == Some(U256::mask(w)) {
+                    return C::Const(w, U256::mask(w));
                 }
                 if has_complement(&rest, w) {
-                    return C::Const(w, mask(w));
+                    return C::Const(w, U256::mask(w));
                 }
             }
             if let Some(kv) = konst {
@@ -325,7 +334,7 @@ fn to_bool(a: C) -> C {
     bits(1, BitOp::ToBool, vec![a])
 }
 
-fn const_of(a: &C, b: &C) -> Option<(u128, u128)> {
+fn const_of(a: &C, b: &C) -> Option<(U256, U256)> {
     match (a, b) {
         (C::Const(w1, v1), C::Const(w2, v2)) if w1 == w2 => Some((*v1, *v2)),
         _ => None,
@@ -335,20 +344,20 @@ fn const_of(a: &C, b: &C) -> Option<(u128, u128)> {
 /// 小于（`Cmp`，结果 1 位）。语义对齐 `lower.rs::lower_lt`。
 fn lt_of(w: u32, a: C, b: C) -> C {
     if a == b {
-        return C::Const(1, 0);
+        return C::Const(1, U256::ZERO);
     }
     if let Some((x, y)) = const_of(&a, &b) {
-        return C::Const(1, (x < y) as u128);
+        return C::Const(1, if x < y { U256::ONE } else { U256::ZERO });
     }
     C::Cmp(w, CmpOp::Lt, Box::new(a), Box::new(b))
 }
 
 fn eq_of(w: u32, a: C, b: C) -> C {
     if a == b {
-        return C::Const(1, 1);
+        return C::Const(1, U256::ONE);
     }
     if let Some((x, y)) = const_of(&a, &b) {
-        return C::Const(1, (x == y) as u128);
+        return C::Const(1, if x == y { U256::ONE } else { U256::ZERO });
     }
     // 对称：排序使 `a==b` 与 `b==a` 规范形一致
     let (x, y) = if a <= b { (a, b) } else { (b, a) };
@@ -391,7 +400,7 @@ pub fn truth(c: &C) -> Option<bool> {
     match c {
         C::Const(w, v) => {
             if *w == 1 {
-                Some(*v != 0)
+                Some(!v.is_zero())
             } else {
                 None
             }
@@ -460,14 +469,14 @@ pub fn truth(c: &C) -> Option<bool> {
 /// 符号求值电路表达式。`None` = 不支持该构造（回落 SAT）。
 fn eval_expr(e: &Expr, env: &HashMap<String, C>) -> Option<C> {
     match e {
-        Expr::Lit(v, w, _) => Some(cst(w.bits(), *v)),
+        Expr::Lit(v, w, _) => Some(cst_u128(w.bits(), *v)),
         Expr::Var(name, _) => {
             if let Some(c) = env.get(name) {
                 return Some(c.clone());
             }
             match name.as_str() {
-                "0" => Some(C::Const(1, 0)),
-                "1" => Some(C::Const(1, 1)),
+                "0" => Some(C::Const(1, U256::ZERO)),
+                "1" => Some(C::Const(1, U256::ONE)),
                 _ => None,
             }
         }
@@ -593,11 +602,12 @@ fn exec_body(
 fn eval_spec(e: &SpecExpr, env: &HashMap<String, C>) -> Option<C> {
     const W: u32 = SPEC_W;
     match e {
-        SpecExpr::Num(n) => Some(cst(W, *n)),
+        SpecExpr::Num(n) => Some(cst_u128(W, *n)),
         SpecExpr::Var(name) => {
             let c = env.get(name)?;
             if c.width() > SPEC_W {
-                return None; // 与 Synth 的端口 >128 位报错一致：不判定
+                // 与 Synth 的「端口 >128 位」报错一致：不判定
+                return None;
             }
             Some(zext(W, c.clone()))
         }
@@ -630,7 +640,7 @@ fn eval_spec(e: &SpecExpr, env: &HashMap<String, C>) -> Option<C> {
 /// 返回 `Some(true)` 表示**已证**（对全部输入成立）；`None` 表示**无法判定**
 /// （调用方必须回落 SAT）。本函数**不会**返回 `Some(false)` —— 反例由 SAT 路径给出。
 pub fn word_prove(circuit: &Circuit, pre: Option<&SpecExpr>, post: &SpecExpr) -> Option<bool> {
-    // 位宽门槛：>128 位无法用 u128 表示 mod 2^w 的系数/常量 → 不判定
+    // 位宽门槛：>256 位超出 U256 表示能力 → 不判定
     let maxw = circuit
         .params
         .iter()
@@ -661,7 +671,7 @@ pub fn word_prove(circuit: &Circuit, pre: Option<&SpecExpr>, post: &SpecExpr) ->
 
     let pre_c = match pre {
         Some(p) => eval_spec(p, &env)?,
-        None => cst(SPEC_W, 1),
+        None => cst_u128(SPEC_W, 1),
     };
     let post_c = eval_spec(post, &env)?;
     let pre_b = to_bool(pre_c);
@@ -688,6 +698,10 @@ mod tests {
         C::Var(w, n.to_string())
     }
 
+    fn k(w: u32, val: u128) -> C {
+        cst_u128(w, val)
+    }
+
     #[test]
     fn cancellation_mod_2w() {
         // (x - a) + (y + a) == x + y   （mod 2^8）
@@ -712,22 +726,42 @@ mod tests {
         rhs = add(w, rhs, v("b2", w));
         rhs = add(w, rhs, v("b3", w));
         assert_eq!(lhs, rhs, "多项求和应规范化为同一形");
-        // 且比较式同形
         let c1 = eq_of(w, lhs, v("total", w));
         let c2 = eq_of(w, rhs, v("total", w));
         assert_eq!(c1, c2);
     }
 
+    /// **本轮的核心验收**：真实 `uint256`（256 位）下的多项重结合。
+    /// 这是报告 §7.2.1 判定「SAT 彻底不可达」的场景。
+    #[test]
+    fn multi_term_reassociation_at_uint256() {
+        let w = 256;
+        let mut lhs = add(
+            w,
+            sub(w, v("b0", w), v("amount", w)),
+            add(w, v("b1", w), v("amount", w)),
+        );
+        lhs = add(w, lhs, v("b2", w));
+        lhs = add(w, lhs, v("b3", w));
+        let mut rhs = add(w, v("b0", w), v("b1", w));
+        rhs = add(w, rhs, v("b2", w));
+        rhs = add(w, rhs, v("b3", w));
+        assert_eq!(lhs, rhs, "uint256 下多项求和也应规范化为同一形");
+    }
+
     #[test]
     fn complement_detection() {
         // AND(x, NOT(x)) == 0 ； 对任意位宽
-        for w in [1u32, 8, 32] {
+        for w in [1u32, 8, 32, 256] {
             let x = v("x", w);
             let nx = bits(w, BitOp::Not, vec![x.clone()]);
-            assert_eq!(bits(w, BitOp::And, vec![x.clone(), nx.clone()]), C::Const(w, 0));
+            assert_eq!(
+                bits(w, BitOp::And, vec![x.clone(), nx.clone()]),
+                C::Const(w, U256::ZERO)
+            );
             assert_eq!(
                 bits(w, BitOp::Or, vec![x.clone(), nx]),
-                C::Const(w, mask(w))
+                C::Const(w, U256::mask(w))
             );
         }
     }
@@ -736,68 +770,110 @@ mod tests {
     fn xor_parity() {
         let w = 8;
         let x = v("x", w);
-        assert_eq!(bits(w, BitOp::Xor, vec![x.clone(), x.clone()]), C::Const(w, 0));
+        assert_eq!(
+            bits(w, BitOp::Xor, vec![x.clone(), x.clone()]),
+            C::Const(w, U256::ZERO)
+        );
     }
 
     #[test]
     fn identity_and_absorption() {
-        let w = 8;
+        let w = 256;
         let x = v("x", w);
         // x & all-ones == x ; x | 0 == x ; x ^ 0 == x
-        assert_eq!(bits(w, BitOp::And, vec![x.clone(), C::Const(w, mask(w))]), x);
-        assert_eq!(bits(w, BitOp::Or, vec![x.clone(), C::Const(w, 0)]), x.clone());
-        assert_eq!(bits(w, BitOp::Xor, vec![x.clone(), C::Const(w, 0)]), x.clone());
+        assert_eq!(
+            bits(w, BitOp::And, vec![x.clone(), C::Const(w, U256::mask(w))]),
+            x
+        );
+        assert_eq!(
+            bits(w, BitOp::Or, vec![x.clone(), C::Const(w, U256::ZERO)]),
+            x.clone()
+        );
+        assert_eq!(
+            bits(w, BitOp::Xor, vec![x.clone(), C::Const(w, U256::ZERO)]),
+            x.clone()
+        );
         // x & 0 == 0
-        assert_eq!(bits(w, BitOp::And, vec![x.clone(), C::Const(w, 0)]), C::Const(w, 0));
+        assert_eq!(
+            bits(w, BitOp::And, vec![x.clone(), C::Const(w, U256::ZERO)]),
+            C::Const(w, U256::ZERO)
+        );
     }
 
     #[test]
     fn truth_on_basic_booleans() {
-        assert_eq!(truth(&C::Const(1, 1)), Some(true));
-        assert_eq!(truth(&C::Const(1, 0)), Some(false));
-        // x == x  => true
+        assert_eq!(truth(&C::Const(1, U256::ONE)), Some(true));
+        assert_eq!(truth(&C::Const(1, U256::ZERO)), Some(false));
         let x = v("x", 8);
         assert_eq!(truth(&eq_of(8, x.clone(), x.clone())), Some(true));
-        // x < x  => false
         assert_eq!(truth(&lt_of(8, x.clone(), x)), Some(false));
     }
 
     #[test]
     fn does_not_prove_inequality() {
         // 规范形不同 **不得** 被判为真：a+b vs a+b+1 不相等，truth 必须为 None
-        let w = 8;
+        let w = 256;
         let s1 = add(w, v("a", w), v("b", w));
-        let s2 = add(w, add(w, v("a", w), v("b", w)), cst(w, 1));
+        let s2 = add(w, add(w, v("a", w), v("b", w)), k(w, 1));
         let e = eq_of(w, s1, s2);
         assert_eq!(truth(&e), None, "不同规范形不得判真（也不得判假）");
-        assert_ne!(e, C::Const(1, 1));
+        assert_ne!(e, C::Const(1, U256::ONE));
     }
 
     #[test]
     fn sub_by_self_is_zero() {
-        let w = 16;
-        assert!(matches!(
-            sub(w, v("x", w), v("x", w)),
-            C::Const(_, 0)
-        ));
+        for w in [16u32, 256] {
+            assert!(matches!(sub(w, v("x", w), v("x", w)), C::Const(_, _)));
+            assert_eq!(sub(w, v("x", w), v("x", w)), C::Const(w, U256::ZERO));
+        }
     }
 
     #[test]
     fn coefficient_wraps_at_width() {
         // 256 次自加 mod 2^8 => 0
         let w = 8;
-        let mut acc = cst(w, 0);
+        let mut acc = k(w, 0);
         for _ in 0..256 {
             acc = add(w, acc, v("x", w));
         }
-        assert_eq!(acc, C::Const(w, 0));
+        assert_eq!(acc, C::Const(w, U256::ZERO));
     }
 
     #[test]
     fn zext_of_const_folds() {
-        assert_eq!(zext(128, C::Const(1, 0)), C::Const(128, 0));
-        assert_eq!(zext(128, C::Const(8, 200)), C::Const(128, 200));
-        // 非 const 保持为原子
+        assert_eq!(
+            zext(128, C::Const(1, U256::ZERO)),
+            C::Const(128, U256::ZERO)
+        );
+        assert_eq!(
+            zext(128, C::Const(8, U256::from_u128(200))),
+            C::Const(128, U256::from_u128(200))
+        );
         assert!(matches!(zext(128, v("x", 8)), C::Zext(128, _)));
+        // uint256 端口可直接参与 128 位规格之外（不在此层）
+        assert!(matches!(zext(256, v("x", 8)), C::Zext(256, _)));
+    }
+
+    /// 256 位常量折叠必须走 `mod 2^256`，不能丢高位。
+    #[test]
+    fn const_folding_at_256_carries() {
+        let w = 256;
+        // (2^128) 作为「常量」无法由字面量构造，但可由常量相加产生：
+        // 用 x 的系数模拟并不合适，故直接测 add_all 的常量路径。
+        let big = add_all(
+            w,
+            vec![
+                (U256::ONE, cst_u128(w, u128::MAX)),
+                (U256::ONE, cst_u128(w, u128::MAX)),
+            ],
+            U256::ZERO,
+        );
+        // 2*(2^128-1) = 2^129 - 2，必须保留超过 128 位
+        let expect = U256::from_u128(u128::MAX).add(U256::from_u128(u128::MAX));
+        assert_eq!(big, C::Const(w, expect));
+        assert!(
+            expect.to_u128().is_none(),
+            "该常量确实超过 128 位 —— 正是 u128 表示不了、必须用 U256 的情形"
+        );
     }
 }

@@ -226,11 +226,11 @@ fn invariant_uint256_is_beyond_exhaustive_verification() {
 
 /// 真实 uint256 位宽下的不变量保持与算术内核引理。
 ///
-/// **慢**（约 9 分钟、累计 200 万次冲突）：默认跳过，用
-/// `cargo test --release -- --ignored` 运行。
+/// 这两条曾需要约 9 分钟、累计 200 万次冲突（纯 SAT 路径）。
+/// 词级重写层（`src/word.rs`）介入后，二者在 bit-blast 之前即被规范化判证
+/// （CNF 规模 0）：release 约 2.6 秒、debug 约 23 秒 —— 已可进默认套件。
 #[test]
-#[ignore = "慢：真实 uint256 位宽的形式化证明约需 9 分钟"]
-fn invariant_preservation_uint256_slow() {
+fn invariant_preservation_uint256() {
     let (decls, compiled) = compile(&invariant_src());
     let reports = prove_all(&decls, &compiled);
 

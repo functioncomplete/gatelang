@@ -1,6 +1,6 @@
 # GateLang — NAND/LATCH 门级可验证计算语言
 
-[![tests](https://img.shields.io/badge/tests-91%20passing-brightgreen)](tests/integration.rs)
+[![tests](https://img.shields.io/badge/tests-104%20passing-brightgreen)](tests/integration.rs)
 [![rust](https://img.shields.io/badge/rust-1.96-orange)](https://www.rust-lang.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-blue)](#构建与测试)
 [![formal](https://img.shields.io/badge/verification-SAT%20%2F%20UNSAT-purple)](#形式化验证sat-后端)
@@ -18,8 +18,8 @@ M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文
 
 ```bash
 cargo build
-cargo test          # 91 个测试（45 单元 + 14 集成 + 22 形式化证明 + 5 ERC-20 + 5 词级重写）
-                    # ERC-20 的 uint256 慢证明用: cargo test --release -- --ignored
+cargo test          # 104 个测试（55 单元 + 14 集成 + 22 形式化证明 + 6 ERC-20 + 7 词级重写）
+                    # 已无 ignored 测试（原 9 分钟的 uint256 证明由词级层降至秒级）
 ```
 
 ## 形式化验证（SAT 后端）
@@ -86,11 +86,13 @@ spec F {
 SAT 后端把一切 bit-blast 成 CNF，于是多项求和的**重结合**必须由 resolution
 自行发现 —— 那是**指数难**的。实测扩展性（N=4 账户不变量保持）：
 
-| 位宽 | 纯 SAT | 词级重写层 |
-|---|---|---|
-| `Bits<8>` | 4 s | **0.006 s** |
-| `Bits<12>` | >120 s 未完成 | **瞬间** |
-| `Bits<32>` | >280 s 未完成 | **0.2 s**（正确版证明 + 漏洞版反例） |
+| N | 位宽 | 纯 SAT | 词级重写层 |
+|---|---|---|---|
+| 4 | `Bits<8>` | 4 s | **0.006 s** |
+| 4 | `Bits<12>` | >120 s 未完成 | **瞬间** |
+| 4 | `Bits<32>` | >280 s 未完成 | **0.2 s**（正确版证明 + 漏洞版反例） |
+| 4 | **真实 `uint256`** | 无可行路径 | **已证明**（CNF 规模 0） |
+| 2 | **真实 `uint256`** | ~9 分钟 | **2.6 s**（debug 23 s，已进默认套件） |
 
 词级层在 **bit-blast 之前**把电路与规格符号求值成**规范形**
 （`Σ cᵢ·atomᵢ + k (mod 2ʷ)`，系数按位宽取模），于是 `(b0-a)+(b1+a)` 与 `b0+b1`
@@ -150,6 +152,7 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 | `examples/erc20_invariant.gat` | **全局不变量 Σbalances==totalSupply（uint256）** | 有界地址域（N=2）下的归纳步；含慢证明（约 9 分钟） |
 | `examples/erc20_invariant_small.gat` | 同上，N=4 @ Bits<8> | 说明账户数本身不是障碍 |
 | `examples/erc20_invariant_n4_32.gat` | **N=4 @ Bits<32> 不变量保持** | 词级重写层对照实验：纯 SAT >280s 无结论，词级 0.2s；含漏洞版反例 |
+| `examples/erc20_invariant_n4_256.gat` | **N=4 @ 真实 uint256 不变量保持** | 报告判定「纯 SAT 完全不可达」的场景，词级层直接证明 |
 
 ## 语言要点（原型子集）
 
@@ -184,6 +187,7 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 | `sat.rs` | 自研 CDCL SAT 求解器（零依赖） |
 | `prove.rs` | **形式化证明**：spec 门级综合 + 反例提取 + miter 等价 |
 | `word.rs` | **词级重写层**：bit-blast 前的位向量规范形（加法重结合/同余），判不了则回落 SAT |
+| `u256.rs` | 零依赖 256 位无符号整数（`mod 2ʷ` 系数/常量），供词级层覆盖真实 `uint256` |
 | `main.rs` | CLI |
 
 ## 形式化验证的实现要点（`prove.rs`）

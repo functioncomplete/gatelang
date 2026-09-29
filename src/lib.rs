@@ -25,6 +25,7 @@ pub mod sat;
 pub mod sim;
 pub mod spec;
 pub mod ty;
+pub mod u256;
 pub mod verify;
 pub mod word;
 
