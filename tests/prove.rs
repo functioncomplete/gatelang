@@ -742,3 +742,118 @@ fn fuzz_equivalence_agrees_with_brute_force() {
     }
     assert!(eqs > 0 && neqs > 0, "模糊测试应同时覆盖等价与不等价（eq={eqs} neq={neqs}）");
 }
+
+/* ==================== 已验证割点（引理组合层） ==================== */
+
+/// 有效割点：割点义务与主义务都应被证明。
+#[test]
+fn valid_cut_is_proven_alongside_main_goal() {
+    // 4 位加法器。割点断言一个（平凡的）中间事实，主目标为加法语义。
+    let src = r#"
+    circuit F(a: Bits<4>, b: Bits<4>) -> (y: Bits<4>) {
+        y = a + b;
+        return y;
+    }
+    spec F {
+        precondition: true;
+        cut: a <= 15;
+        postcondition: y == (a + b) % (2^4);
+        invariant: true;
+    }"#;
+    let (decls, compiled) = compile(src);
+    let reports = prove_all(&decls, &compiled);
+    let rep = reports[0].as_ref().expect("报告");
+    assert!(rep.all_proven(), "有效割点与主目标都应被证明: {:?}", rep.obligations);
+    // 必须存在一条 kind == "cut" 的义务（割点被独立判定）
+    assert!(
+        rep.obligations.iter().any(|o| o.kind == "cut"),
+        "割点必须作为独立义务出现: {:?}",
+        rep.obligations.iter().map(|o| &o.kind).collect::<Vec<_>>()
+    );
+}
+
+/// **可靠性关键测试**：假割点可以让主目标"看起来成立"，
+/// 但工具必须把割点义务标为被驳倒，从而使整体**不得**判定为已证明。
+#[test]
+fn invalid_cut_cannot_produce_a_false_proof() {
+    // y = a；主目标 y == b 全局**不成立**（a、b 独立）。
+    // 但若允许假设 cut: a == b，则主目标会"成立"。
+    // 工具必须先证明割点 —— 割点是假的，因此整体不得通过。
+    let src = r#"
+    circuit F(a: Bit, b: Bit) -> (y: Bit) {
+        y = a;
+        return y;
+    }
+    spec F {
+        precondition: true;
+        cut: a == b;
+        postcondition: y == b;
+        invariant: true;
+    }"#;
+    let (decls, compiled) = compile(src);
+    let reports = prove_all(&decls, &compiled);
+    let rep = reports[0].as_ref().expect("报告");
+    assert!(
+        !rep.all_proven(),
+        "假割点绝不能让整体判定为已证明（这是假证明的入口）: {:?}",
+        rep.obligations.iter().map(|o| (&o.kind, &o.verdict)).collect::<Vec<_>>()
+    );
+    // 割点义务必须被明确标为被驳倒
+    let cut_ob = rep
+        .obligations
+        .iter()
+        .find(|o| o.kind == "cut")
+        .expect("应有 cut 义务");
+    assert!(
+        matches!(cut_ob.verdict, Verdict::Refuted { .. }),
+        "假割点必须被驳倒: {:?}",
+        cut_ob.verdict
+    );
+    // 主目标在假割点下会"通过" —— 这正说明割点义务是可靠性所必需的
+    let main_ob = rep
+        .obligations
+        .iter()
+        .find(|o| o.kind == "postcondition")
+        .expect("应有 postcondition 义务");
+    assert!(
+        matches!(main_ob.verdict, Verdict::Proven),
+        "主目标在割点假设下确实成立（说明若跳过割点检查就会产生假证明）"
+    );
+}
+
+/// 割点语义必须与穷举验证器一致（两侧交叉验证）。
+#[test]
+fn cut_semantics_agree_with_exhaustive_verifier() {
+    let cases = [
+        // (割点, 主目标) —— 割点真、目标真
+        ("(a + b) % (2^4) >= a", "(a + b) % (2^4) >= a"),
+        // 割点真、目标假
+        ("a <= 15", "a == b"),
+        // 割点假 → 两侧都必须报告失败
+        ("a == b", "a == a"),
+    ];
+    for (cut, post) in cases {
+        let src = [
+            "circuit F(a: Bits<4>, b: Bits<4>) -> (y: Bits<4>) { y = a; return y; }\n",
+            "spec F { precondition: true; cut: ",
+            cut,
+            "; postcondition: ",
+            post,
+            "; invariant: true; }",
+        ]
+        .concat();
+        let (decls, compiled) = compile(&src);
+        let brute = verify_all(&decls, &compiled);
+        let sat = prove_all(&decls, &compiled);
+        let rep = sat[0].as_ref().expect("报告");
+        assert_eq!(
+            brute.ok(),
+            rep.all_proven(),
+            "割点 `{cut}` / 目标 `{post}`：穷举({}) 与 SAT({}) 结论不一致；穷举失败 {:?}，SAT {:?}",
+            brute.ok(),
+            rep.all_proven(),
+            brute.failed,
+            rep.obligations.iter().map(|o| (&o.kind, &o.verdict)).collect::<Vec<_>>()
+        );
+    }
+}

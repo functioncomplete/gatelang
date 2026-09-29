@@ -1,6 +1,6 @@
 # GateLang — NAND/LATCH 门级可验证计算语言
 
-[![tests](https://img.shields.io/badge/tests-73%20passing-brightgreen)](tests/integration.rs)
+[![tests](https://img.shields.io/badge/tests-76%20passing-brightgreen)](tests/integration.rs)
 [![rust](https://img.shields.io/badge/rust-1.96-orange)](https://www.rust-lang.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-blue)](#构建与测试)
 [![formal](https://img.shields.io/badge/verification-SAT%20%2F%20UNSAT-purple)](#形式化验证sat-后端)
@@ -18,7 +18,7 @@ M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文
 
 ```bash
 cargo build
-cargo test          # 73 个测试（35 单元 + 14 集成 + 19 形式化证明 + 5 ERC-20）
+cargo test          # 76 个测试（35 单元 + 14 集成 + 22 形式化证明 + 5 ERC-20）
                     # ERC-20 的 uint256 慢证明用: cargo test --release -- --ignored
 ```
 
@@ -56,6 +56,30 @@ cargo run --quiet -- examples/halfadder.gat --prove-equiv HalfAdder5 HalfAdderNa
 
 已知**原型上限**（全部 fail-closed，报错而非给出错误结论）：非常量除数的取模、
 超宽乘法（非二次幂/非常量路径）、综合门数预算 400k。
+
+## 已验证割点（`cut:`）—— 引理组合层
+
+`spec` 可声明一条**中间断言**，工具会分两阶段判定：
+
+```gat
+spec F {
+    precondition: true;
+    cut: l <= 15;                       // 阶段 A：先证明 cut 在 pre 下恒真
+    postcondition: y == (l + r) % (2^4); // 阶段 B：在 pre ∧ cut 下证明目标
+    invariant: true;
+}
+```
+
+- **可靠性**：只有阶段 A 成立，把 `cut` 当作假设加入阶段 B 才是可靠的。
+  若割点被驳倒，报告**整体不得**判定为已证明 ——
+  `tests/prove.rs::invalid_cut_cannot_produce_a_false_proof` 专门锁定这一点。
+- 割点以独立义务（`kind == "cut"`）出现在报告中，`all_proven()` 要求它也被证明。
+
+**实测的局限（诚实记录）**：割点是"断言"，不是"重写"。
+实测它**无法**解决多项求和的**加法结合律/同余**问题
+（`(b0-a)+(b1+a)+b2+b3` 与 `(b0+b1+b2+b3)-a`）——
+因为 SAT 没有**同余闭包**，而加法结合律对 resolution 是指数难的（文献已知结果）。
+真正的解法是**项重写**（让两侧共享信号）或词级推理，不是加断言。
 
 ## CLI
 
@@ -109,6 +133,8 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
   - 比较运算符**同级左结合**：`a > b == c` 解析为 `((a > b) == c)`，需要 `(a > b) == c` 时请显式加括号
 - **spec**：`precondition` / `postcondition` / `invariant` / `edge_cases`，内建求值器（`+ - * %` 比较 `&& || !`、`2^N`、`MAX_UINT`）
   - spec 算术是 **u128 回绕语义**（不是端口位宽模运算）：`Bits<4>` 的 `a + b + cin >= 2` 才能拿到进位
+  - spec **没有位运算** `&` / `|` / `^`（只有 `&&` / `||`）；位运算请放进电路
+  - `cut:` 是**已验证割点**（见下）
 - **门数与白皮书叙事一致**：半加器共享实现 = 5 个 NAND 门（v2.1 §4.2）
 
 ## 模块（单 crate 多模块）

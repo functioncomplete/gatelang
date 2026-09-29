@@ -457,6 +457,7 @@ impl Parser {
         let mut pre = None;
         let mut post = None;
         let mut invariant = None;
+        let mut cut = None;
         let mut edge_cases = Vec::new();
         loop {
             match self.peek().clone() {
@@ -479,6 +480,11 @@ impl Parser {
                     self.expect(&Tok::Colon, ":")?;
                     invariant = Some(self.parse_expr_to_semi()?);
                 }
+                Tok::Cut => {
+                    self.bump();
+                    self.expect(&Tok::Colon, ":")?;
+                    cut = Some(self.parse_expr_to_semi()?);
+                }
                 Tok::EdgeCases => {
                     self.bump();
                     self.expect(&Tok::Colon, ":")?;
@@ -489,10 +495,10 @@ impl Parser {
                     self.expect(&Tok::RBracket, "]")?;
                     self.eat(&Tok::Semi);
                 }
-                other => return Err(format!("{:?}: spec 体内只允许 precondition/postcondition/invariant/edge_cases，实际 {other:?}", self.span())),
+                other => return Err(format!("{:?}: spec 体内只允许 precondition/postcondition/invariant/cut/edge_cases，实际 {other:?}", self.span())),
             }
         }
-        Ok(Spec { name, pre, post, invariant, edge_cases, span: sp })
+        Ok(Spec { name, pre, post, invariant, cut, edge_cases, span: sp })
     }
 
     /// 解析到分号的表达式，返回其源码文本（spec 以文本保存，供验证器求值）。

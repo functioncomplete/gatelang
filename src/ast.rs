@@ -175,12 +175,21 @@ pub enum BinOp {
 }
 
 /// 规范块：spec Name { precondition:... postcondition:... edge_cases:[...] invariant:... }
+///
+/// `cut` 是**已验证割点**（verified cut）：一条中间断言，工具会先独立证明它
+/// 在 `precondition` 下恒成立，然后把它作为**假设**加进主证明。
+///
+/// 因为割点被独立证明为真，把它加进主证明是**可靠**的（不会排除任何真实模型），
+/// 同时能显著降低多求和项重结合类性质的求解难度 —— 这正是形式化验证中
+/// "引理组合"的标准做法。
 #[derive(Debug, Clone)]
 pub struct Spec {
     pub name: String,
     pub pre: Option<String>,
     pub post: Option<String>,
     pub invariant: Option<String>,
+    /// 已验证割点（可选）
+    pub cut: Option<String>,
     pub edge_cases: Vec<String>,
     pub span: Span,
 }

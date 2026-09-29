@@ -119,10 +119,25 @@ pub fn verify_all(decls: &[Decl], compiled: &[Compiled]) -> VerifyReport {
                         }
                         out_map.insert(p.name.clone(), v);
                     }
+                    // 已验证割点：必须在 pre 下恒成立（与 prove.rs 的两阶段语义一致）
+                    if let Some(cut) = &spec.cut {
+                        match crate::spec::assert_spec(cut, &input_map, &out_map) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                rep.failed.push(format!("{name}: cut 违反 @输入 x={x:#x}"));
+                                ok = false;
+                                break 'outer;
+                            }
+                            Err(e) => {
+                                rep.failed.push(format!("{name}: cut 求值错误 {e}"));
+                                ok = false;
+                                break 'outer;
+                            }
+                        }
+                    }
                     // 后置条件
                     if let Some(post) = &spec.post {
-                        match crate::spec::assert_spec(post, &input_map, &out_map) {
-                            Ok(true) => {}
+                        match crate::spec::assert_spec(post, &input_map, &out_map) {                            Ok(true) => {}
                             Ok(false) => {
                                 rep.failed.push(format!("{name}: postcondition 违反 @输入 x={x:#x}"));
                                 ok = false;

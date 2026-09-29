@@ -498,17 +498,31 @@ fn extract_inputs(
     parts.join(", ")
 }
 
-/// 对一条义务做形式化判定。
+/// 对一条义务做形式化判定，支持**已验证割点**（引理组合层）。
 ///
 /// 语义：在 `pre` 成立的全部输入上，`goal` 是否恒真？
-/// 编码为 `pre ∧ ¬goal` 的可满足性：UNSAT ⇒ 已证明。
+///
+/// 若给出 `cut`，则分两个阶段：
+///
+/// - **阶段 A（割点有效性）**：判定 `pre ∧ ¬cut`。UNSAT ⇒ 割点在 `pre` 下恒真。
+/// - **阶段 B（主判定）**：判定 `pre ∧ cut ∧ ¬goal`。
+///
+/// **可靠性**：只有阶段 A 成立时，把 `cut` 作为假设加入阶段 B 才是可靠的 ——
+/// 因为割点对全部满足 `pre` 的输入都为真，加它不会排除任何真实反例。
+/// 若阶段 A 失败，割点本身被驳倒，主判定结果**不得**被采信（工具会同时报告）。
+///
+/// 这正是形式化验证中"引理组合"的标准做法，用来对付多求和项重结合等
+/// 单实例 SAT 难以处理的性质。
 fn discharge(
     compiled: &Compiled,
     kind: &str,
     statement: &str,
     pre: Option<&SpecExpr>,
+    cut: Option<&SpecExpr>,
+    // 割点的源码文本（用于报告中展示；`SpecExpr` 未实现 Display）
+    cut_text: Option<&str>,
     goal: &SpecExpr,
-) -> Result<Obligation, String> {
+) -> Result<Vec<Obligation>, String> {
     let base_nl = match compiled {
         Compiled::Combinational { netlist, .. } => netlist,
         Compiled::State { .. } => return Err("形式化证明当前仅支持组合电路".into()),
@@ -527,28 +541,41 @@ fn discharge(
         }
         None => synth.nl.add_const(1),
     };
+    let cut_sig = match cut {
+        Some(c) => {
+            let bv = synth.encode(c)?;
+            Some(synth.to_bool(&bv))
+        }
+        None => None,
+    };
     if synth.over_budget() {
-        return Ok(Obligation {
+        return Ok(vec![Obligation {
             kind: kind.to_string(),
             statement: statement.to_string(),
             verdict: Verdict::Unknown { reason: "规格综合超出预算".into() },
             stats: SatStats::default(),
             cnf_vars: 0,
             cnf_clauses: 0,
-        });
+        }]);
     }
 
     let enc = encode_netlist(&nl);
-    let mut cnf = enc.cnf.clone();
+    let pre_v = enc.var_of(pre_sig).ok_or("pre 信号无对应变量")?;
+    let goal_v = enc.var_of(goal_sig).ok_or("goal 信号无对应变量")?;
+    let cut_v = match cut_sig {
+        Some(s) => Some(enc.var_of(s).ok_or("cut 信号无对应变量")?),
+        None => None,
+    };
+
+    let mut out: Vec<Obligation> = Vec::new();
 
     // 前置条件不可满足检查：pre 单独是否可满足？
     {
         let mut c = enc.cnf.clone();
-        let pv = enc.var_of(pre_sig).ok_or("pre 信号无对应变量")?;
-        c.add_unit(pv);
+        c.add_unit(pre_v);
         let mut s = Solver::new(&c);
         if s.solve() == SolveResult::Unsat {
-            return Ok(Obligation {
+            out.push(Obligation {
                 kind: kind.to_string(),
                 statement: statement.to_string(),
                 verdict: Verdict::Unknown { reason: "前置条件恒不成立（输入域为空）".into() },
@@ -556,13 +583,43 @@ fn discharge(
                 cnf_vars: c.num_vars,
                 cnf_clauses: c.clauses.len(),
             });
+            return Ok(out);
         }
     }
 
-    // 主判定：pre ∧ ¬goal
-    let pre_v = enc.var_of(pre_sig).ok_or("pre 信号无对应变量")?;
-    let goal_v = enc.var_of(goal_sig).ok_or("goal 信号无对应变量")?;
+    // 阶段 A：割点有效性（pre ⟹ cut）
+    if let Some(cv) = cut_v {
+        let mut c = enc.cnf.clone();
+        c.add_unit(pre_v);
+        c.add_unit(-cv);
+        c.validate()?;
+        let mut solver = Solver::new(&c);
+        let res = solver.solve();
+        let stats = solver.stats.clone();
+        let verdict = match res {
+            SolveResult::Unsat => Verdict::Proven,
+            SolveResult::Sat => {
+                let model = solver.model();
+                Verdict::Refuted { input: extract_inputs(compiled, &enc, &model) }
+            }
+            SolveResult::Unknown => Verdict::Unknown { reason: "求解器触及冲突上限".into() },
+        };
+        out.push(Obligation {
+            kind: "cut".to_string(),
+            statement: cut_text.unwrap_or_default().to_string(),
+            verdict,
+            stats,
+            cnf_vars: c.num_vars,
+            cnf_clauses: c.clauses.len(),
+        });
+    }
+
+    // 阶段 B：主判定 pre ∧ [cut] ∧ ¬goal
+    let mut cnf = enc.cnf.clone();
     cnf.add_unit(pre_v);
+    if let Some(cv) = cut_v {
+        cnf.add_unit(cv);
+    }
     cnf.add_unit(-goal_v);
     cnf.validate()?;
 
@@ -577,14 +634,15 @@ fn discharge(
         }
         SolveResult::Unknown => Verdict::Unknown { reason: "求解器触及冲突上限".into() },
     };
-    Ok(Obligation {
+    out.push(Obligation {
         kind: kind.to_string(),
         statement: statement.to_string(),
         verdict,
         stats,
         cnf_vars: cnf.num_vars,
         cnf_clauses: cnf.clauses.len(),
-    })
+    });
+    Ok(out)
 }
 
 /// 把规格表达式综合为门级电路（工具与测试用）。
@@ -646,15 +704,37 @@ pub fn prove_spec(compiled: &Compiled, spec: &Spec) -> Result<ProveReport, Strin
         }
     }
 
+    // 已验证割点（可选）：工具会先独立证明它在 precondition 下恒成立
+    let cut = match &spec.cut {
+        Some(c) => Some(parse_spec(c)?),
+        None => None,
+    };
+
     if let Some(post) = &spec.post {
         let e = parse_spec(post)?;
-        rep.obligations.push(discharge(compiled, "postcondition", post, pre.as_ref(), &e)?);
+        rep.obligations.extend(discharge(
+            compiled,
+            "postcondition",
+            post,
+            pre.as_ref(),
+            cut.as_ref(),
+            spec.cut.as_deref(),
+            &e,
+        )?);
     }
     if let Some(inv) = &spec.invariant {
         let e = parse_spec(inv)?;
         // invariant == true 是平凡义务，跳过（与既有语料一致）
         if !matches!(e, SpecExpr::Num(1)) {
-            rep.obligations.push(discharge(compiled, "invariant", inv, pre.as_ref(), &e)?);
+            rep.obligations.extend(discharge(
+                compiled,
+                "invariant",
+                inv,
+                pre.as_ref(),
+                cut.as_ref(),
+                spec.cut.as_deref(),
+                &e,
+            )?);
         }
     }
     Ok(rep)

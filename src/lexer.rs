@@ -23,6 +23,8 @@ pub enum Tok {
     Post,
     Invariant,
     EdgeCases,
+    /// `cut:` —— 已验证割点（引理组合层）
+    Cut,
     // 标识符
     Ident(String),
     // 字面量
@@ -200,6 +202,7 @@ impl<'a> Lexer<'a> {
                         "postcondition" => Tok::Post,
                         "invariant" => Tok::Invariant,
                         "edge_cases" => Tok::EdgeCases,
+                        "cut" => Tok::Cut,
                         _ => Tok::Ident(s),
                     };
                     out.push(Token { tok, span: sp });
