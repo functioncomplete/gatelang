@@ -1,6 +1,6 @@
 //! 递归下降解析器：Token 流 → AST。
 //!
-//! 语法子集（对应白皮书 v2.1 §4 抽象模型 + §5 类型）：
+//! 语法子集（对应白皮书 v2.2 §4 抽象模型 + §5 类型）：
 //! - `circuit Name(p: T, ...) -> (r: T, ...) bound* { stmt* }`
 //!   其中 T = Bit | Bits<N>；bound = gates: Gates<N> / depth: Depth<N> / cycles: Cycles<N>
 //! - `state Name { latch v: T = init; fn f(...) -> (...) { stmt* } }`

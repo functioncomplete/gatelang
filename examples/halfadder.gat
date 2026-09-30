@@ -1,4 +1,4 @@
-// 半加器示例（白皮书 v2.1 §4.2 + §4.3 语义保持展开）
+// 半加器示例（白皮书 v2.2 §4.2 + §4.3 语义保持展开）
 // 规范级共享 t=NAND(a,b)：整个半加器 = 5 个 NAND 门
 // （lib/netlist.rs 的 half_adder() 是 5 门；此处用 GateLang 源码展开同构验证）
 circuit HalfAdder5(a: Bit, b: Bit) -> (sum: Bit, carry: Bit) {

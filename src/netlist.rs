@@ -1,6 +1,6 @@
 //! NAND/LATCH 网表 IR。
 //!
-//! 语义保持编译的最终形态（白皮书 v2.1 §7.2）：所有高级结构
+//! 语义保持编译的最终形态（白皮书 v2.2 §7.2）：所有高级结构
 //! 展开为 NAND 门（组合）与 LATCH 触发器（时序）的网表。
 //! 本模块同时提供 NAND 原语库：每个基本逻辑结构 → NAND 门的展开，
 //! 展开恒以真实 NAND 计数（NOT=1, AND=2, OR=3, XOR=4, 半加器=5, 全加器=15）。
@@ -134,7 +134,7 @@ impl Netlist {
 
     /// 半加器：sum = XOR(a,b)，carry = AND(a,b)。
     /// 共享 t=NAND(a,b)：t(1) + NOT t → carry(1) + XOR 借 t 的 3 门 = 5 门。
-    /// 与白皮书 v2.1「整个半加器由 5 个 NAND 门构成」一致。
+    /// 与白皮书 v2.2「整个半加器由 5 个 NAND 门构成」一致。
     pub fn half_adder(&mut self, a: Sig, b: Sig) -> (Sig, Sig) {
         let t = self.nand(a, b);         // 1 门
         let carry = self.not(t);          // 2 门
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn half_adder_5gates() {
-        // 白皮书 v2.1：「整个半加器由 5 个 NAND 门构成」
+        // 白皮书 v2.2：「整个半加器由 5 个 NAND 门构成」
         let mut nl = Netlist::default();
         let a = nl.add_input("a");
         let b = nl.add_input("b");

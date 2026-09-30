@@ -1,4 +1,4 @@
-// 半加器（白皮书 v2.1 §4.2）
+// 半加器（白皮书 v2.2 §4.2）
 // 本实现用门级原语 XOR(4)+AND(2) = 6 门（不共享 t）。
 // 共享 t 的 5 门实现见 halfadder.gat 的 HalfAdder5。
 circuit HalfAdder(a: Bit, b: Bit) -> (sum: Bit, carry: Bit) {

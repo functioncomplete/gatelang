@@ -1,8 +1,8 @@
-//! FCT 后端（《FunctionComplete 技术组件白皮书 v1.3》§3.3）。
+//! FCT 后端（《FunctionComplete 技术组件白皮书 v1.4》§3.3）。
 //!
 //! `gatelangc --fct <dir>` 把编译产物导出为 FCT 兼容工件：
 //! - **门级函数 IR**：NAND/LATCH 网表 + 资源元数据（门数/深度/周期/LATCH 数）
-//! - **DSU 描述文件**：类别 / 参数 / 成本模型 / 预编译地址（v1.3 §4.2）
+//! - **DSU 描述文件**：类别 / 参数 / 成本模型 / 预编译地址（v1.4 §4.2）
 //! - **验证电路**：状态根验证 / Merkle 证明验证 / 共识验证（接口描述）
 //! - **SP1 / RISC Zero guest program**：可选模板
 //! - **manifest.json**：工件清单 + 每个门级函数的 networkHash（SHA-256）
@@ -83,7 +83,7 @@ fn gate_ir_json(
 ) -> String {
     let st = nl.stats();
     let mut s = String::new();
-    let _ = write!(s, "{{\n  \"kind\": \"gate_function_ir\",\n  \"spec\": \"FCT v1.3 §3.3\",\n  \"name\": \"{}\",\n", esc(name));
+    let _ = write!(s, "{{\n  \"kind\": \"gate_function_ir\",\n  \"spec\": \"FCT v1.4 §3.3\",\n  \"name\": \"{}\",\n", esc(name));
     s.push_str("  \"inputs\": [");
     for (i, p) in inputs.iter().enumerate() {
         if i > 0 {
@@ -177,7 +177,7 @@ fn gate_ir_json(
 fn dsu_descriptor_json() -> String {
     r#"{
   "kind": "dsu_descriptor",
-  "spec": "FCT v1.3 §4.2",
+  "spec": "FCT v1.4 §4.2",
   "categories": [
     {"name": "HASH",          "scenarios": "Poseidon / Blake3 / SHA-256", "cost_model": "per-hash + per-byte",          "precompile": "0x0000000000000000000000000000000000000000"},
     {"name": "SIGN",          "scenarios": "EdDSA / BLS / secp256k1",      "cost_model": "per-signature + batch discount", "precompile": "0x0000000000000000000000000000000000000000"},
@@ -195,7 +195,7 @@ fn dsu_descriptor_json() -> String {
 fn verification_circuits_json() -> String {
     r#"{
   "kind": "verification_circuits",
-  "spec": "FCT v1.3 §3.3",
+  "spec": "FCT v1.4 §3.3",
   "circuits": [
     {"name": "state_root_verify",        "purpose": "重算压缩状态承诺根",             "inputs": ["leaf", "index", "siblings[]"],                 "output": "root"},
     {"name": "merkle_inclusion_verify",  "purpose": "二进制 Merkle 包含证明",         "inputs": ["leaf", "index", "siblings[]", "root"],         "output": "ok"},
@@ -208,7 +208,7 @@ fn verification_circuits_json() -> String {
 
 /* ============================ guest program（可选） ============================ */
 
-const SP1_GUEST: &str = r#"//! FCT Prover guest program 模板（SP1，可选，v1.3 §3.3）。
+const SP1_GUEST: &str = r#"//! FCT Prover guest program 模板（SP1，可选，v1.4 §3.3）。
 //! 用途：将 DSU 组合执行 / 门级函数重放编译为 zkEVM 可证明程序。
 //!
 //! 用法（示意）：
@@ -225,7 +225,7 @@ pub fn main() {
 }
 "#;
 
-const RISCZERO_GUEST: &str = r#"//! FCT Prover guest program 模板（RISC Zero，可选，v1.3 §3.3）。
+const RISCZERO_GUEST: &str = r#"//! FCT Prover guest program 模板（RISC Zero，可选，v1.4 §3.3）。
 //! 用途：将 DSU 组合执行 / 门级函数重放编译为 RISC-V zkVM 可证明程序。
 #![no_main]
 #![no_std]
@@ -242,7 +242,7 @@ pub fn main() {
 
 fn manifest_json(source: &str, funcs: &[(String, &'static str, u32, u32, String)]) -> String {
     let mut s = String::new();
-    s.push_str("{\n  \"kind\": \"fct_backend_manifest\",\n  \"spec\": \"FCT v1.3 §3.3\",\n");
+    s.push_str("{\n  \"kind\": \"fct_backend_manifest\",\n  \"spec\": \"FCT v1.4 §3.3\",\n");
     let _ = write!(s, "  \"source\": \"{}\",\n", esc(source));
     s.push_str("  \"compiler\": \"gatelangc (gatelang prototype)\",\n");
     s.push_str("  \"artifacts\": [\"gate_ir/*.json\", \"dsu_descriptor.json\", \"verification_circuits.json\", \"guest/sp1_main.rs\", \"guest/risczero_main.rs\"],\n");
@@ -251,7 +251,7 @@ fn manifest_json(source: &str, funcs: &[(String, &'static str, u32, u32, String)
         if i > 0 {
             s.push_str(",\n");
         }
-        // networkHash = SHA-256(门级函数 IR)：跨链身份锚（FCT v1.3 §3.4/§8.2）
+        // networkHash = SHA-256(门级函数 IR)：跨链身份锚（FCT v1.4 §3.4/§8.2）
         let _ = write!(
             s,
             "    {{\"name\":\"{}\",\"kind\":\"{}\",\"gates\":{},\"depth\":{},\"networkHash\":\"0x{}\"}}",

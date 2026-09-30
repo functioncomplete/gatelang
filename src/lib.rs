@@ -1,6 +1,6 @@
 //! GateLang — 基于 NAND/LATCH 的门级可验证计算语言。
 //!
-//! M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文档 v2.1》）：
+//! M5 原型实现（依据《GateLang 技术白皮书 v2.2》与《软件开发文档 v2.1》）：
 //!
 //! ```text
 //! 源码 ──lexer──▶ Token ──parser──▶ AST ──type-check──▶ 类型化 AST

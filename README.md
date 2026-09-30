@@ -1,11 +1,11 @@
-# GateLang — NAND/LATCH 门级可验证计算语言
+# GateLang — 基于 NAND/LATCH 的可验证逻辑-状态计算语言
 
 [![tests](https://img.shields.io/badge/tests-122%20passing-brightgreen)](tests/integration.rs)
 [![rust](https://img.shields.io/badge/rust-1.96-orange)](https://www.rust-lang.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-0-blue)](#构建与测试)
 [![formal](https://img.shields.io/badge/verification-SAT%20%2F%20UNSAT-purple)](#形式化验证sat-后端)
 
-M5 原型实现（依据《GateLang 技术白皮书 v2.1》与《软件开发文档 v2.1》）。
+M5 原型实现（依据《GateLang 技术白皮书 v2.2》与《软件开发文档 v2.1》）。
 
 ```text
 源码 ──lexer──▶ Token ──parser──▶ AST ──lower(语义保持展开)──▶ NAND/LATCH 网表
@@ -156,7 +156,7 @@ $ gatelang multest.gat --prove      # postcondition: a * b == b * a
 # 编译并打印资源（门数/深度/周期）
 cargo run --quiet -- examples/adder4.gat
 
-# FCT 后端（《FCT 技术组件白皮书 v1.3》§3.3）：导出门级函数 IR / DSU 描述 / 验证电路 / guest 模板
+# FCT 后端（《FCT 技术组件白皮书 v1.4》§3.3）：导出门级函数 IR / DSU 描述 / 验证电路 / guest 模板
 cargo run --quiet -- examples/stdlib_l1.gat --fct ./fct-out
 
 # spec 验证（穷举输入真值表检查前后置条件）
@@ -207,7 +207,7 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
   - spec 算术是 **u128 回绕语义**（不是端口位宽模运算）：`Bits<4>` 的 `a + b + cin >= 2` 才能拿到进位
   - spec **没有位运算** `&` / `|` / `^`（只有 `&&` / `||`）；位运算请放进电路
   - `cut:` 是**已验证割点**（见下）
-- **门数与白皮书叙事一致**：半加器共享实现 = 5 个 NAND 门（v2.1 §4.2）
+- **门数与白皮书叙事一致**：半加器共享实现 = 5 个 NAND 门（v2.2 §4.2）
 
 ## 模块（单 crate 多模块）
 
@@ -248,6 +248,6 @@ cargo run --quiet -- examples/adder4_spec.gat --sim Adder4 15 1
 
 ## 参考
 
-- GateLang 技术白皮书 v2.1（本目录）
+- GateLang 技术白皮书 v2.2（本目录）
 - GateLang 软件开发文档 v2.1（本目录）
 - FCT 双原语开发计划 §5.2/5.3（DSU 运行时 / 共享层）

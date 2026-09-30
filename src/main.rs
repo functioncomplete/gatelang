@@ -209,7 +209,7 @@ fn main() -> ExitCode {
         }
         println!("  ✓ 全部满足规范");
     }
-    // FCT 后端（《FCT 技术组件白皮书 v1.3》§3.3）：
+    // FCT 后端（《FCT 技术组件白皮书 v1.4》§3.3）：
     // 输出门级函数 IR / DSU 描述文件 / 验证电路 / guest 模板 / manifest。
     if let Some(pos) = args.iter().position(|a| a == "--fct") {
         let out = args
