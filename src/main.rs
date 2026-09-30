@@ -6,7 +6,7 @@
 //!   gatelang <file.gat> --check-equiv A B  检查 A 与 B 组合电路等价
 //!   gatelang <file.gat> --check-equiv A B --domain "expr"   在约束输入域内检查等价
 //!   gatelang <file.gat> --sim NAME a b     模拟组合电路（十进制输入）
-//!   gatelang <file.gat> --fct [DIR]        FCT 后端：导出门级 IR / DSU 描述 / 验证电路 / guest 模板
+//!   gatelang <file.gat> --fct [DIR]        FCT 后端：导出逻辑原语 IR / DSU 描述 / 验证函数 / guest 模板
 //!   gatelang <file.gat> --prove            形式化证明（SAT 后端，全输入而非穷举）
 //!   gatelang <file.gat> --prove-equiv A B  形式化等价证明（miter + SAT，输入位宽无上限）
 
@@ -210,7 +210,7 @@ fn main() -> ExitCode {
         println!("  ✓ 全部满足规范");
     }
     // FCT 后端（《FCT 技术组件白皮书 v1.4》§3.3）：
-    // 输出门级函数 IR / DSU 描述文件 / 验证电路 / guest 模板 / manifest。
+    // 输出逻辑原语函数 IR / DSU 描述文件 / 验证函数 / guest 模板 / manifest。
     if let Some(pos) = args.iter().position(|a| a == "--fct") {
         let out = args
             .get(pos + 1)

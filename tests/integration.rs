@@ -277,7 +277,7 @@ fn malformed_input_errors_not_panics() {
 
 #[test]
 fn fct_backend_emits_artifacts() {
-    // FCT 后端（v1.4 §3.3）：应输出门级 IR / DSU 描述 / 验证电路 / guest / manifest
+    // FCT 后端（v1.4 §3.3）：应输出逻辑原语 IR / DSU 描述 / 验证函数 / guest / manifest
     let (_, c) = compile("circuit Adder4(a: Bits<4>, b: Bits<4>) -> (s: Bits<4>) { s = a + b; return s; }");
     let dir = std::env::temp_dir().join(format!("fct_it_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

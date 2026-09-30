@@ -1,11 +1,11 @@
 //! FCT 后端（《FunctionComplete 技术组件白皮书 v1.4》§3.3）。
 //!
 //! `gatelangc --fct <dir>` 把编译产物导出为 FCT 兼容工件：
-//! - **门级函数 IR**：NAND/LATCH 网表 + 资源元数据（门数/深度/周期/LATCH 数）
+//! - **逻辑原语函数 IR**：NAND/LATCH 逻辑原语 IR + 资源元数据（门数/深度/周期/LATCH 数）
 //! - **DSU 描述文件**：类别 / 参数 / 成本模型 / 预编译地址（v1.4 §4.2）
-//! - **验证电路**：状态根验证 / Merkle 证明验证 / 共识验证（接口描述）
+//! - **验证函数**：状态根验证 / Merkle 证明验证 / 共识验证（接口描述）
 //! - **SP1 / RISC Zero guest program**：可选模板
-//! - **manifest.json**：工件清单 + 每个门级函数的 networkHash（SHA-256）
+//! - **manifest.json**：工件清单 + 每个逻辑原语函数的 networkHash（SHA-256）
 //!
 //! 零外部依赖（手写 JSON 序列化与 SHA-256）。
 
@@ -64,13 +64,13 @@ pub fn emit(compiled: &[Compiled], out_dir: &str, source_path: &str) -> Result<(
         .map_err(|e| e.to_string())?;
 
     println!(
-        "FCT 后端产物 -> {out_dir}/  （gate_ir/ {} 个门级函数 + dsu_descriptor + verification_circuits + guest/ + manifest.json）",
+        "FCT 后端产物 -> {out_dir}/  （gate_ir/ {} 个逻辑原语函数 + dsu_descriptor + verification_circuits + guest/ + manifest.json）",
         funcs.len()
     );
     Ok(())
 }
 
-/* ============================ 门级函数 IR ============================ */
+/* ============================ 逻辑原语函数 IR ============================ */
 
 fn gate_ir_json(
     name: &str,
@@ -108,7 +108,7 @@ fn gate_ir_json(
         s.push_str("]}");
     }
     s.push_str("],\n");
-    // LATCH 状态（含初值与 next 信号映射）：时序电路的身份与重放都依赖它
+    // LATCH 状态（含初值与 next 信号映射）：时序逻辑的身份与重放都依赖它
     s.push_str("  \"latches\": [");
     for (i, l) in latches.iter().enumerate() {
         if i > 0 {
@@ -190,7 +190,7 @@ fn dsu_descriptor_json() -> String {
     .to_string()
 }
 
-/* ============================ 验证电路 ============================ */
+/* ============================ 验证函数 ============================ */
 
 fn verification_circuits_json() -> String {
     r#"{
@@ -209,7 +209,7 @@ fn verification_circuits_json() -> String {
 /* ============================ guest program（可选） ============================ */
 
 const SP1_GUEST: &str = r#"//! FCT Prover guest program 模板（SP1，可选，v1.4 §3.3）。
-//! 用途：将 DSU 组合执行 / 门级函数重放编译为 zkEVM 可证明程序。
+//! 用途：将 DSU 组合执行 / 逻辑原语函数重放编译为 zkEVM 可证明程序。
 //!
 //! 用法（示意）：
 //!   let mut stdin = sp1_zkvm::io::read::<Input>();
@@ -219,20 +219,20 @@ const SP1_GUEST: &str = r#"//! FCT Prover guest program 模板（SP1，可选，
 sp1_zkvm::entrypoint!(main);
 
 pub fn main() {
-    // TODO: 读入输入 → 执行 DSU/门级重放 → commit 输出与状态根
+    // TODO: 读入输入 → 执行 DSU/逻辑原语重放 → commit 输出与状态根
     let input: Vec<u8> = sp1_zkvm::io::read();
     sp1_zkvm::io::commit(&input);
 }
 "#;
 
 const RISCZERO_GUEST: &str = r#"//! FCT Prover guest program 模板（RISC Zero，可选，v1.4 §3.3）。
-//! 用途：将 DSU 组合执行 / 门级函数重放编译为 RISC-V zkVM 可证明程序。
+//! 用途：将 DSU 组合执行 / 逻辑原语函数重放编译为 RISC-V zkVM 可证明程序。
 #![no_main]
 #![no_std]
 risc0_zkvm::guest::entry!(main);
 
 pub fn main() {
-    // TODO: 读入输入 → 执行 DSU/门级重放 → commit 输出与状态根
+    // TODO: 读入输入 → 执行 DSU/逻辑原语重放 → commit 输出与状态根
     let input: Vec<u8> = risc0_zkvm::guest::env::read();
     risc0_zkvm::guest::env::commit(&input);
 }
@@ -251,7 +251,7 @@ fn manifest_json(source: &str, funcs: &[(String, &'static str, u32, u32, String)
         if i > 0 {
             s.push_str(",\n");
         }
-        // networkHash = SHA-256(门级函数 IR)：跨链身份锚（FCT v1.4 §3.4/§8.2）
+        // networkHash = SHA-256(逻辑原语函数 IR)：跨链身份锚（FCT v1.4 §3.4/§8.2）
         let _ = write!(
             s,
             "    {{\"name\":\"{}\",\"kind\":\"{}\",\"gates\":{},\"depth\":{},\"networkHash\":\"0x{}\"}}",
@@ -291,7 +291,7 @@ fn esc(s: &str) -> String {
     o
 }
 
-/// 纯 Rust SHA-256（FIPS 180-4）。用于门级函数 IR 的 networkHash（跨链身份锚）。
+/// 纯 Rust SHA-256（FIPS 180-4）。用于逻辑原语函数 IR 的 networkHash（跨链身份锚）。
 pub fn sha256_hex(data: &[u8]) -> String {
     const K: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
