@@ -1,0 +1,108 @@
+{
+  "format": "fct-verification/1.0",
+  "kind": "gatelang-verification",
+  "tool": "gatelang",
+  "toolVersion": "v2.2",
+  "method": "CDCL SAT + Tseitin; UNSAT means the property holds for all inputs (not sampling)",
+  "sourceFile": "examples/erc20_core.gat",
+  "sourceSha256": "d09f6fad38e8042d2204ab78331858750b7621e49cdec4fe1858d76d5f5524ff",
+  "summary": { "circuits": 5, "proven": 6, "refuted": 2, "unknown": 0, "errors": 0 },
+  "reports": [
+    {
+      "circuit": "FCT.erc20.ERC20SafeSub",
+      "preUnsatisfiable": false,
+      "obligations": [
+        {
+          "kind": "postcondition",
+          "statement": "ok==(a>=b)",
+          "verdict": "proven",
+          "cnfVars": 4611,
+          "cnfClauses": 12263,
+          "conflicts": 94
+        },
+        {
+          "kind": "invariant",
+          "statement": "d==(a-b)%(2^16)",
+          "verdict": "proven",
+          "cnfVars": 4707,
+          "cnfClauses": 12355,
+          "conflicts": 997
+        }
+      ]
+    },
+    {
+      "circuit": "FCT.erc20.ERC20SubBuggy",
+      "preUnsatisfiable": false,
+      "obligations": [
+        {
+          "kind": "postcondition",
+          "statement": "ok==(a>=b)",
+          "verdict": "refuted",
+          "cnfVars": 4353,
+          "cnfClauses": 11489,
+          "conflicts": 32,
+          "counterexample": "a=0x0, b=0xffff"
+        }
+      ]
+    },
+    {
+      "circuit": "FCT.erc20.ERC20SafeAdd",
+      "preUnsatisfiable": false,
+      "obligations": [
+        {
+          "kind": "postcondition",
+          "statement": "ok==(a+b<2^16)",
+          "verdict": "proven",
+          "cnfVars": 6643,
+          "cnfClauses": 18101,
+          "conflicts": 539
+        },
+        {
+          "kind": "invariant",
+          "statement": "s==(a+b)%(2^16)",
+          "verdict": "proven",
+          "cnfVars": 4563,
+          "cnfClauses": 11923,
+          "conflicts": 744
+        }
+      ]
+    },
+    {
+      "circuit": "FCT.erc20.ERC20Transfer",
+      "preUnsatisfiable": false,
+      "obligations": [
+        {
+          "kind": "postcondition",
+          "statement": "(newFrom+newTo)%(2^16)==(fromBal+toBal)%(2^16)",
+          "verdict": "proven",
+          "cnfVars": 7370,
+          "cnfClauses": 19586,
+          "conflicts": 12366
+        },
+        {
+          "kind": "invariant",
+          "statement": "(!ok||newFrom<=fromBal)&&newTo==(toBal+amount)%(2^16)",
+          "verdict": "proven",
+          "cnfVars": 9918,
+          "cnfClauses": 26216,
+          "conflicts": 1151
+        }
+      ]
+    },
+    {
+      "circuit": "FCT.erc20.ERC20TransferBuggy",
+      "preUnsatisfiable": false,
+      "obligations": [
+        {
+          "kind": "postcondition",
+          "statement": "!ok||newTo>=toBal",
+          "verdict": "refuted",
+          "cnfVars": 5245,
+          "cnfClauses": 13863,
+          "conflicts": 76,
+          "counterexample": "fromBal=0x1, toBal=0xffff, amount=0x1"
+        }
+      ]
+    }
+  ]
+}

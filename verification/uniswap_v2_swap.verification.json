@@ -1,0 +1,54 @@
+{
+  "format": "fct-verification/1.0",
+  "kind": "gatelang-verification",
+  "tool": "gatelang",
+  "toolVersion": "v2.2",
+  "method": "CDCL SAT + Tseitin; UNSAT means the property holds for all inputs (not sampling)",
+  "sourceFile": "examples/uniswap_v2_swap.gat",
+  "sourceSha256": "5b543a2ff3f62e17d90a4c0151bb409f6382a410a7d67cf2b560a2441ff8b63d",
+  "summary": { "circuits": 3, "proven": 3, "refuted": 0, "unknown": 0, "errors": 0 },
+  "reports": [
+    {
+      "circuit": "T.UniswapV2KNonDecreasing",
+      "preUnsatisfiable": false,
+      "obligations": [
+        {
+          "kind": "postcondition",
+          "statement": "(R0+dIn)*(R1-dOut)>=R0*R1",
+          "verdict": "proven",
+          "cnfVars": 0,
+          "cnfClauses": 0,
+          "conflicts": 0
+        }
+      ]
+    },
+    {
+      "circuit": "T.UniswapV2ReverseDirection",
+      "preUnsatisfiable": false,
+      "obligations": [
+        {
+          "kind": "postcondition",
+          "statement": "(R1+dIn)*(R0-dOut)>=R0*R1",
+          "verdict": "proven",
+          "cnfVars": 0,
+          "cnfClauses": 0,
+          "conflicts": 0
+        }
+      ]
+    },
+    {
+      "circuit": "T.UniswapV2Conservation",
+      "preUnsatisfiable": false,
+      "obligations": [
+        {
+          "kind": "postcondition",
+          "statement": "(R0+dIn)*(R1-dOut)+dOut*(R0+dIn)==R0*R1+dIn*R1",
+          "verdict": "proven",
+          "cnfVars": 0,
+          "cnfClauses": 0,
+          "conflicts": 0
+        }
+      ]
+    }
+  ]
+}

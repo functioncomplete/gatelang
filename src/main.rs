@@ -8,6 +8,7 @@
 //!   gatelang <file.gat> --sim NAME a b     模拟组合电路（十进制输入）
 //!   gatelang <file.gat> --fct [DIR]        FCT 后端：导出逻辑原语 IR / DSU 描述 / 验证函数 / guest 模板
 //!   gatelang <file.gat> --prove            形式化证明（SAT 后端，全输入而非穷举）
+//!   gatelang <file.gat> --prove --json     形式化证明的机器可读清单（供链上锚定 / 第三方核验）
 //!   gatelang <file.gat> --prove-equiv A B  形式化等价证明（miter + SAT，输入位宽无上限）
 
 use std::process::ExitCode;
@@ -50,10 +51,13 @@ fn main() -> ExitCode {
         }
     };
 
-    // 默认：资源报告
-    println!("== 编译产物 ==");
-    for c in &compiled {
-        println!("{}", summarize(c));
+    // 默认：资源报告（--json 模式下静默，保证 stdout 是纯 JSON）
+    let json_mode = args.iter().any(|a| a == "--json");
+    if !json_mode {
+        println!("== 编译产物 ==");
+        for c in &compiled {
+            println!("{}", summarize(c));
+        }
     }
     // 等价值对比
     if let Some(pos) = args.iter().position(|a| a == "--check-equiv") {
@@ -150,6 +154,17 @@ fn main() -> ExitCode {
     // 形式化证明（SAT 后端）
     if args.iter().any(|a| a == "--prove") {
         let reports = prove_all(&decls, &compiled);
+        // 机器可读导出：--prove --json（供链上锚定 / 第三方核验）
+        if args.iter().any(|a| a == "--json") {
+            print!("{}", prove_json(&args[1], &src, &reports));
+            let bad = reports
+                .iter()
+                .any(|r| match r {
+                    Ok(rep) => rep.pre_unsatisfiable || !rep.all_proven(),
+                    Err(_) => true,
+                });
+            return ExitCode::from(if bad { 1 } else { 0 });
+        }
         println!("\n== 形式化证明（SAT 后端）==");
         if reports.is_empty() {
             println!("  文件中没有 spec 声明");
@@ -262,4 +277,96 @@ fn main() -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// JSON 字符串转义（最小实现，维持零依赖）。
+fn jesc(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\r' => o.push_str("\\r"),
+            '\t' => o.push_str("\\t"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o
+}
+
+/// 把 `--prove` 的结果导出为机器可读清单（`--prove --json`）。
+///
+/// 用途：`manifestHash = sha256_hex(本输出)`（或 keccak）锚定到链上，
+/// 完整清单放链下（GitHub / IPFS），第三方即可「核哈希 + 重跑证明」。
+fn prove_json(
+    path: &str,
+    src: &str,
+    reports: &[Result<gatelang::prove::ProveReport, String>],
+) -> String {
+    let (mut n_circ, mut n_proven, mut n_refuted, mut n_unknown, mut n_err) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut reps: Vec<String> = Vec::new();
+    for r in reports {
+        match r {
+            Ok(rep) => {
+                n_circ += 1;
+                let mut obs: Vec<String> = Vec::new();
+                for ob in &rep.obligations {
+                    let (v, extra) = match &ob.verdict {
+                        Verdict::Proven => {
+                            n_proven += 1;
+                            ("proven", String::new())
+                        }
+                        Verdict::Refuted { input } => {
+                            n_refuted += 1;
+                            (
+                                "refuted",
+                                format!(",\n          \"counterexample\": \"{}\"", jesc(input)),
+                            )
+                        }
+                        Verdict::Unknown { reason } => {
+                            n_unknown += 1;
+                            (
+                                "unknown",
+                                format!(",\n          \"reason\": \"{}\"", jesc(reason)),
+                            )
+                        }
+                    };
+                    obs.push(format!(
+                        "        {{\n          \"kind\": \"{}\",\n          \"statement\": \"{}\",\n          \"verdict\": \"{}\",\n          \"cnfVars\": {},\n          \"cnfClauses\": {},\n          \"conflicts\": {}{}\n        }}",
+                        jesc(&ob.kind),
+                        jesc(&ob.statement),
+                        v,
+                        ob.cnf_vars,
+                        ob.cnf_clauses,
+                        ob.stats.conflicts,
+                        extra
+                    ));
+                }
+                reps.push(format!(
+                    "    {{\n      \"circuit\": \"{}\",\n      \"preUnsatisfiable\": {},\n      \"obligations\": [\n{}\n      ]\n    }}",
+                    jesc(&rep.circuit),
+                    rep.pre_unsatisfiable,
+                    obs.join(",\n")
+                ));
+            }
+            Err(e) => {
+                n_err += 1;
+                reps.push(format!("    {{\n      \"error\": \"{}\"\n    }}", jesc(e)));
+            }
+        }
+    }
+    format!(
+        "{{\n  \"format\": \"fct-verification/1.0\",\n  \"kind\": \"gatelang-verification\",\n  \"tool\": \"gatelang\",\n  \"toolVersion\": \"v2.2\",\n  \"method\": \"CDCL SAT + Tseitin; UNSAT means the property holds for all inputs (not sampling)\",\n  \"sourceFile\": \"{}\",\n  \"sourceSha256\": \"{}\",\n  \"summary\": {{ \"circuits\": {}, \"proven\": {}, \"refuted\": {}, \"unknown\": {}, \"errors\": {} }},\n  \"reports\": [\n{}\n  ]\n}}\n",
+        jesc(path),
+        gatelang::fct::sha256_hex(src.as_bytes()),
+        n_circ,
+        n_proven,
+        n_refuted,
+        n_unknown,
+        n_err,
+        reps.join(",\n")
+    )
 }
