@@ -70,6 +70,22 @@ sha256sum examples/erc20_core.gat
 
 一键脚本见 [`verify.sh`](./verify.sh)。
 
+### 清单镜像
+
+`raw.githubusercontent.com` 偶有不稳定，可用以下任一镜像取回同一份清单（内容一致）：
+
+```bash
+# 官方 raw
+curl -sO https://raw.githubusercontent.com/functioncomplete/gatelang/main/verification/erc20_core.verification.json
+# jsDelivr CDN
+curl -sO https://cdn.jsdelivr.net/gh/functioncomplete/gatelang@main/verification/erc20_core.verification.json
+# GitHub API（base64 内嵌）
+curl -s https://api.github.com/repos/functioncomplete/gatelang/contents/verification/erc20_core.verification.json?ref=main \
+  | python3 -c "import json,sys,base64;print(base64.b64decode(json.load(sys.stdin)['content']).decode())"
+```
+
+无论从哪个镜像取，**清单哈希都必须等于链上锚定值**——镜像只影响取回方式，不影响可信性。
+
 ---
 
 ## 4. 清单格式（`fct-verification/1.0`）
