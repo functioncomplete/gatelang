@@ -150,3 +150,18 @@ anchor(
 
 `anchor` 无访问控制：任何人都可提交。**可信性不来自提交者身份，而来自「哈希 + 可复现」**——
 任何人都能在本地重跑并核对，任何篡改都会在哈希或 diff 处暴露。
+
+
+---
+
+## 附：fct-library 验证清单（镜像）
+
+`functioncomplete/library` 仓库为**私有**，故其验证清单在此**公开镜像**一份，便于第三方核验：
+
+- 清单：[`fct-library/fct-library.verification.json`](./fct-library/fct-library.verification.json)
+- 链上记录：`FCTVerificationAnchor` `0x17dC325d1F8Ff24c8BCF2419b4060C7D062B98f1` 第 3 条（proven = 22）
+- manifestHash：`0xc6cce3643ac802f1cf1a4f102a5588b4f4ab017e3ea1a28c05e1bd59d151b75a`
+
+核验：`cast keccak "$(cat fct-library/fct-library.verification.json)"` 应等于上述 manifestHash。
+
+> 建议：将 `functioncomplete/library` 设为公开，使链上记录里的原始 URI 直接可取。
